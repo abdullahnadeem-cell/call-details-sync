@@ -212,7 +212,7 @@ def _xp_text_or_label(labels: tuple[str, ...], tags: str = "button | a | div[@ro
     return f"//*[self::{' or self::'.join(t.strip() for t in tags.split('|'))}][{' or '.join(conds)}]"
 
 
-_CLICK_BY_TEXT_JS = """
+_CLICK_BY_TEXT_JS = r"""
 const needle = arguments[0].toLowerCase();
 const vis = el => !!(el.offsetParent || el.getClientRects().length);
 const clickable = el => el.closest('button, a, li, [role=button], [role=link], [role=option], [role=radio], [tabindex], [jsaction], [onclick]');
@@ -257,7 +257,7 @@ def _visible_choices(driver, limit: int = 12) -> list[str]:
     """Texts of the visible choice-like elements on a page, digits masked (for logs only)."""
     try:
         texts = driver.execute_script(
-            """const vis = el => !!(el.offsetParent || el.getClientRects().length);
+            r"""const vis = el => !!(el.offsetParent || el.getClientRects().length);
                return Array.from(document.querySelectorAll('li, [role=link], [role=button], [role=option], [role=radio], button'))
                  .filter(vis).map(e => (e.innerText || '').replace(/\s+/g, ' ').trim()).filter(t => t && t.length < 160);"""
         ) or []

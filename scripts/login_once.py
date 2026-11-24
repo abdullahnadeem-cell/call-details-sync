@@ -25,6 +25,7 @@ from selenium import webdriver  # noqa: E402
 from selenium.webdriver.chrome.options import Options  # noqa: E402
 from selenium.webdriver.chrome.service import Service  # noqa: E402
 
+from src.config import load_dotenv  # noqa: E402
 from src.session import export_cookies, summarize  # noqa: E402
 
 PROFILE_DIR = Path(".login-profile")
@@ -45,14 +46,27 @@ def report_loaded(driver) -> bool:
     return (n or 0) >= 3 or bool(re.search(r"\d+\s*[-–]\s*\d+\s*of\s*\d+|no data|no results", text, re.I))
 
 
+def resolve_report_url(cli_value: str | None, env_file: str = ".env") -> str | None:
+    """--url wins, then GADS_REPORT_URL from the environment, then from the local .env file."""
+    if cli_value:
+        return cli_value
+    load_dotenv(env_file)
+    return os.environ.get("GADS_REPORT_URL") or None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--url", default=os.environ.get("GADS_REPORT_URL"), help="saved report link (default: $GADS_REPORT_URL)")
+    ap.add_argument("--url", default=None, help="saved report link (default: GADS_REPORT_URL from the environment or .env)")
     ap.add_argument("--out", default=str(OUT_FILE))
     ap.add_argument("--wait-minutes", type=int, default=15, help="how long to wait for the manual login")
     args = ap.parse_args()
+    args.url = resolve_report_url(args.url)
     if not args.url:
-        print("Give the saved report link with --url or set GADS_REPORT_URL.", file=sys.stderr)
+        print(
+            "GADS_REPORT_URL is empty. Open .env (on a Mac: open -e .env), paste the saved Call details link "
+            "after GADS_REPORT_URL=, save the file, and run this again.",
+            file=sys.stderr,
+        )
         return 2
 
     opts = Options()

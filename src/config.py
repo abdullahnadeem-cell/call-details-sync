@@ -85,7 +85,7 @@ class Config:
 
     def require_scrape(self) -> None:
         if not self.report_url:
-            raise SyncError(MISSING_SECRETS, "GADS_REPORT_URL is not set")
+            raise SyncError(MISSING_SECRETS, "GADS_REPORT_URL is empty: open .env (macOS: open -e .env), paste the saved Call details link after GADS_REPORT_URL=, save, and run again")
         if self.gads_session or self.chrome_debug_url:
             return  # a saved session or an attached signed-in Chrome is enough; credentials are only a fallback
         missing = self.missing_login_secrets()

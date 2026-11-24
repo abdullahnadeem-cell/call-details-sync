@@ -1,4 +1,5 @@
 """Error codes shared by the runner, the workflow and the README."""
+from __future__ import annotations
 
 
 class SyncError(Exception):
