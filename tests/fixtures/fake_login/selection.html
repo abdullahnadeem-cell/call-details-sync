@@ -1,0 +1,10 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Sign in - Google Accounts</title><script src="common.js"></script></head>
+<body>
+<h1>Choose how you want to sign in:</h1>
+<ul>
+  <li><div role="link" tabindex="0" data-go="tap.html"><div><div>Tap <b>Yes</b> on your phone or tablet</div></div></div></li>
+  <li><div role="link" tabindex="0" data-go="totp.html"><div><div>Get a verification code from the <strong>Google Authenticator</strong> app</div></div></div></li>
+  <li><div role="link" tabindex="0" data-go="challenge.html"><div><div>Get a verification code at (•••) •••-••03</div></div></div></li>
+</ul>
+<script>document.querySelectorAll('[data-go]').forEach(e => e.addEventListener('click', () => go(e.dataset.go)));</script>
+</body></html>

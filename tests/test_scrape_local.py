@@ -181,6 +181,14 @@ def test_login_account_chooser_and_password_only(scraper_factory, server):
         assert how == "password"
 
 
+def test_login_tap_prompt_then_try_another_way_picks_authenticator(scraper_factory, server, capsys):
+    with scraper_factory() as s:
+        how = ensure_logged_in(s.driver, creds(), log=print, accounts_url=f"{server}/fake_login/index.html?mode=tap", step_pause=0.2)
+    assert how == "password+totp"
+    out = capsys.readouterr().out
+    assert "sign-in methods offered" in out and "••##" in out or "##" in out  # digits masked in the log
+
+
 @pytest.mark.parametrize(
     "mode,totp,code",
     [

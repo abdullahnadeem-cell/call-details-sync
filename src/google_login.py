@@ -212,6 +212,24 @@ def _xp_text_or_label(labels: tuple[str, ...], tags: str = "button | a | div[@ro
     return f"//*[self::{' or self::'.join(t.strip() for t in tags.split('|'))}][{' or '.join(conds)}]"
 
 
+_CLICK_BY_TEXT_JS = """
+const needle = arguments[0].toLowerCase();
+const vis = el => !!(el.offsetParent || el.getClientRects().length);
+const clickable = el => el.closest('button, a, li, [role=button], [role=link], [role=option], [role=radio], [tabindex], [jsaction], [onclick]');
+for (const el of document.querySelectorAll('body *')) {
+  if (!vis(el) || el.children.length > 3) continue;
+  const own = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const label = (el.getAttribute('aria-label') || '').toLowerCase();
+  if (!own.includes(needle) && !label.includes(needle)) continue;
+  const target = clickable(el) || el;
+  target.scrollIntoView({block: 'center'});
+  target.click();
+  return true;
+}
+return false;
+"""
+
+
 def _click_first(driver, labels: tuple[str, ...]) -> bool:
     from selenium.webdriver.common.by import By
 
@@ -225,7 +243,33 @@ def _click_first(driver, labels: tuple[str, ...]) -> bool:
                     return True
             except Exception:  # noqa: BLE001
                 continue
+    # fallback: any visible text node containing the label, clicking its nearest clickable ancestor
+    for lab in labels:
+        try:
+            if driver.execute_script(_CLICK_BY_TEXT_JS, lab):
+                return True
+        except Exception:  # noqa: BLE001
+            continue
     return False
+
+
+def _visible_choices(driver, limit: int = 12) -> list[str]:
+    """Texts of the visible choice-like elements on a page, digits masked (for logs only)."""
+    try:
+        texts = driver.execute_script(
+            """const vis = el => !!(el.offsetParent || el.getClientRects().length);
+               return Array.from(document.querySelectorAll('li, [role=link], [role=button], [role=option], [role=radio], button'))
+                 .filter(vis).map(e => (e.innerText || '').replace(/\s+/g, ' ').trim()).filter(t => t && t.length < 160);"""
+        ) or []
+    except Exception:  # noqa: BLE001
+        return []
+    seen, out = set(), []
+    for t in texts:
+        t = re.sub(r"\d", "#", t)
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out[:limit]
 
 
 def _type(driver, css_candidates: tuple[str, ...], value: str) -> bool:
@@ -361,9 +405,11 @@ def ensure_logged_in(
                 if not _click_first(driver, ("Use another account",)):
                     raise SyncError(LOGIN_CHALLENGE, "account chooser without the expected account")
         elif screen == TRY_ANOTHER_WAY:
+            choices = _visible_choices(driver)
+            log(f"[login] sign-in methods offered: {choices}")
             if not _click_first(driver, ("Google Authenticator", "Authenticator app", "authenticator")):
                 _dump(driver, debug_dir, "no-authenticator-option", log)
-                raise SyncError(LOGIN_CHALLENGE, "Google offered only verification methods a script cannot use")
+                raise SyncError(LOGIN_CHALLENGE, f"Google offered only verification methods a script cannot use: {choices}")
         elif screen == DISMISSIBLE:
             if not _click_first(driver, DISMISS_LABELS):
                 _dump(driver, debug_dir, "undismissable", log)
