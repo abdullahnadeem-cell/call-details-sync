@@ -61,9 +61,10 @@ jobs:
           done
           [ -n "$GADS_EMAIL" ] && echo "::add-mask::${GADS_EMAIL%%@*}"
           MISSING=""
-          for v in GADS_EMAIL GADS_PASSWORD GADS_TOTP_SECRET GADS_REPORT_URL; do
+          for v in GADS_EMAIL GADS_PASSWORD GADS_REPORT_URL; do
             [ -z "${!v}" ] && MISSING="$MISSING $v"
           done
+          [ -z "$GADS_TOTP_SECRET" ] && echo "::warning::GADS_TOTP_SECRET is empty: the run fails with LOGIN_TOTP_MISSING if Google asks for an authenticator code"
           if [ "$IS_DRY" != "true" ]; then
             for v in SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY; do
               [ -z "${!v}" ] && MISSING="$MISSING $v"
