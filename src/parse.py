@@ -219,7 +219,6 @@ def normalize_row(raw: dict, mapping: dict[str, str], tz: str) -> dict:
         "display_location": _text_or_none(by_canon.get("display_location")),
         "ad_telephony_group": _text_or_none(by_canon.get("ad_telephony_group")),
         "campaign": campaign,
-        "status": None,
         "raw": {k: (None if v is None else str(v)) for k, v in raw.items()},
     }
     row["call_key"] = call_key(start, caller_phone_raw, duration, campaign)

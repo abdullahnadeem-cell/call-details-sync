@@ -135,7 +135,7 @@ def test_csv_fixture_round_trip():
     assert first["display_location"] == "Ad"
     assert first["ad_telephony_group"] == "Call extension"
     assert first["campaign"] == "TCA - Search - Brand"
-    assert first["status"] is None
+    assert "status" not in first  # never sent, so a status set elsewhere is not overwritten
     assert first["raw"]["Start time"] == "Nov 20, 2026, 8:05:12 AM"
     assert set(first["raw"]) == set(raw[0])
     assert rows[1]["recording_url"] == "https://ads.google.com/recordings/abc123"
@@ -144,7 +144,7 @@ def test_csv_fixture_round_trip():
     assert rows[4]["duration_seconds"] == 3723
     # no columns the trigger owns are sent
     for r in rows:
-        for forbidden in ("caller_phone_e164", "campaign_id", "call_date_hst", "caller_phone_number", "call_source", "ad_group"):
+        for forbidden in ("caller_phone_e164", "campaign_id", "call_date_hst", "caller_phone_number", "call_source", "ad_group", "status"):
             assert forbidden not in r
 
 

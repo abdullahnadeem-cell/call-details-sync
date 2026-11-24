@@ -127,7 +127,8 @@ Or with the GitHub CLI:
 gh secret set GADS_STORAGE_STATE --body "$(base64 -w0 storage_state.json)"
 ```
 
-The repository **must stay private**: failure screenshots contain phone numbers.
+The repository **must stay private**: failure screenshots and dry-run logs contain phone numbers.
+Check Settings → General → Danger Zone → Change visibility.
 
 ## 3. Running
 
@@ -173,6 +174,23 @@ python -m src.run --from 2026-11-01 --to $(date -u -d 'yesterday' +%F)
 
 or run the workflow with `from=2026-11-01`, `to=<yesterday>`. Re-running any part of
 the range is safe.
+
+### Loading rows through SQL instead of the REST key
+
+If the rows were read some other way (for example from a CSV downloaded by hand) and you
+want to load them without the service role key, parse them with `--dry-run`, then turn the
+JSON into upsert SQL and run it in the Supabase SQL editor or through the Supabase connector.
+It is the same upsert on `call_key`, so re-running never duplicates.
+
+```bash
+python -m src.run --from-file "Call details.csv" --date 2026-11-20 --dry-run --out out/rows.json
+```
+
+```bash
+python scripts/rows_to_sql.py out/rows.json > out/load.sql
+```
+
+`status` is never written, so a status set elsewhere is not overwritten by a re-run.
 
 ### Verify in Supabase (SQL editor)
 
