@@ -19,7 +19,7 @@ from pathlib import Path
 
 from . import parse
 from .config import Config
-from .dates import HST, days_in, default_range, split_range
+from .dates import days_in, default_range, split_range, today_in
 from .errors import CONFIG_ERROR, DATE_RANGE_MISMATCH, SyncError
 from .masking import mask_phone
 from .reconcile import format_table, print_reconciliation
@@ -97,7 +97,7 @@ def collect_rows(cfg: Config, start: date, end: date, headed: bool) -> tuple[lis
     cfg.require_scrape()
     session_cookies = load_session(cfg.gads_session)
     credentials = Credentials(cfg.gads_email, cfg.gads_password, cfg.gads_totp_secret) if cfg.gads_email and cfg.gads_password else None
-    log(f"[run] auth: saved_session={'yes' if session_cookies else 'no'} credentials={'yes' if credentials else 'no'} proxy={'yes' if cfg.proxy_url else 'no'}")
+    log(f"[run] auth: saved_session={cfg.session_source} credentials={'yes' if credentials else 'no'} proxy={'yes' if cfg.proxy_url else 'no'} attached_chrome={'yes' if cfg.chrome_debug_url else 'no'}")
     chunks = split_range(start, end)
     log(f"[run] {len(chunks)} page load(s) for {start}..{end}")
     raw_rows: list[dict] = []
@@ -113,6 +113,7 @@ def collect_rows(cfg: Config, start: date, end: date, headed: bool) -> tuple[lis
         credentials=credentials,
         session_cookies=session_cookies,
         proxy_url=cfg.proxy_url,
+        chrome_debug_url=cfg.chrome_debug_url,
     ) as scraper:
         log(f"[run] google session: {scraper.login_method}")
         for cs, ce in chunks:
@@ -157,6 +158,9 @@ def main(argv: list[str] | None = None) -> int:
         error_code_file.unlink()
     try:
         start, end = resolve_range(args)
+        today = today_in(cfg.account_tz)
+        if end > today:
+            raise SyncError(CONFIG_ERROR, f"end date {end} is after today in the account time zone ({cfg.account_tz}: {today}); Google has no data for future days")
         days = [d.isoformat() for d in days_in(start, end)]
         log(f"[run] range {start}..{end} ({len(days)} day(s)), account tz {cfg.account_tz}, dry_run={args.dry_run}")
 
@@ -183,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
                 if cfg.supabase_url and cfg.supabase_key:
                     from .supabase_sink import SupabaseSink
                     sink = SupabaseSink(cfg.supabase_url, cfg.supabase_key, log=log)
-                print_reconciliation(rows, days, sink, log=log)
+                print_reconciliation(rows, days, sink, log=log, tz=cfg.account_tz)
             return 0
 
         cfg.require_supabase()
@@ -197,7 +201,7 @@ def main(argv: list[str] | None = None) -> int:
             log("[run] zero calls in the report for this range; nothing to write")
         if not args.no_reconcile:
             try:
-                print_reconciliation(rows, days, sink, log=log)
+                print_reconciliation(rows, days, sink, log=log, tz=cfg.account_tz)
             except Exception as exc:  # noqa: BLE001 - informational only
                 log(f"[reconcile] skipped: {type(exc).__name__}: {exc}")
         return 0

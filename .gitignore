@@ -6,6 +6,7 @@ storage-state.json
 *.storage_state.json
 .env
 .env.*
+!.env.example
 browser-profile/
 .playwright-profile/
 

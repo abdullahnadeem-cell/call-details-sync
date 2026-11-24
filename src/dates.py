@@ -4,8 +4,16 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-HST = "Pacific/Honolulu"
+HST = "Pacific/Honolulu"            # Hawaii: the business, used for the default day window and call_date_hst in the DB
+ACCOUNT_TZ_DEFAULT = "America/Los_Angeles"  # the Google Ads account time zone: the report shows call times in it
 MAX_DAYS_PER_LOAD = 7
+
+
+def today_in(tz: str, now: datetime | None = None) -> date:
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return now.astimezone(ZoneInfo(tz)).date()
 
 
 def default_range(now: datetime | None = None, lookback: int = 2, tz: str = HST) -> tuple[date, date]:

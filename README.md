@@ -5,8 +5,11 @@ every call (including the caller's phone number, which the Google Ads API never
 exposes) into the Supabase table `public.google_ads_call_details`. The TCA Wireless
 dashboard uses that table to tie call leads to sales.
 
-- Runs entirely on GitHub Actions (06:30 HST and 18:30 HST), or by hand for any day or range.
-- Python 3.12 + Selenium (Chrome). No frontend, no n8n, no schema changes, nothing on anyone's computer.
+- Python 3.12 + Selenium (Chrome). No frontend, no n8n, no schema changes.
+- **Reliable run mode: locally, in a browser you signed in to once** (`scripts/login_once.py` or
+  `scripts/chrome.sh`). The GitHub Actions schedule exists, but Google refuses scripted sign-ins from
+  GitHub's datacenter addresses with CAPTCHAs and phone prompts, so until a self-hosted runner on a
+  normal connection is set up, run it from your own computer (§3).
 - Authenticates in this order: a **saved session** captured once on a normal computer
   (`GADS_SESSION`), then, only if that is rejected, a self sign-in as the dedicated Workspace
   account (password + authenticator code from GitHub secrets). Plain Selenium, no stealth tricks:
@@ -34,6 +37,14 @@ call-details-sync/
 ---
 
 ## 1. How it works
+
+**Two time zones, both on purpose.** The Google Ads *account* is on Pacific time
+(`America/Los_Angeles`): the report shows every call time in it, so the parser reads the displayed
+time in that zone and stores the exact UTC instant in `start_time` (a call shown as Nov 6, 12:00 PM
+is `2026-11-06T20:00:00Z`; minutes and seconds are kept; daylight saving is handled by the IANA zone,
+which switched from UTC-7 to UTC-8 on Nov 1, 2026). The database trigger then derives
+`call_date_hst` in Hawaii time (`Pacific/Honolulu`) because the calls go to a Hawaii business and are
+matched to Hawaii-day sales. Do not "fix" one to match the other.
 
 1. **Date range.** With no arguments the run covers the last 2 full days in Hawaii
    time (yesterday and the day before), because Google delivers call data late and
@@ -120,7 +131,7 @@ Repo → **Settings → Secrets and variables → Actions**. Never paste these a
 | `SUPABASE_URL` | secret | `https://hdwkfqjgnuahqmmaseor.supabase.co` |
 | `SUPABASE_SERVICE_ROLE_KEY` | secret | Supabase → Project Settings → API → `service_role` |
 | `ALERT_WEBHOOK_URL` | secret, optional | any webhook that accepts a JSON POST (`{"text": "..."}`) |
-| `GADS_ACCOUNT_TZ` | **variable**, optional | Google Ads account time zone, default `Pacific/Honolulu` |
+| `GADS_ACCOUNT_TZ` | **variable**, optional | Google Ads account time zone, default `America/Los_Angeles` |
 | `RUNNER_LABEL` | **variable**, optional | runner label, default `ubuntu-latest` (see §6) |
 | `GADS_PROFILE_DIR` | **variable**, optional | persistent Chrome profile folder on a self-hosted runner |
 
@@ -150,11 +161,40 @@ Actions → **call-details-sync** → **Run workflow**. Inputs: `date` (one day)
 Scheduled runs happen at 16:30 UTC (06:30 HST) and 04:30 UTC (18:30 HST). Two runs never
 overlap (concurrency group) and each is limited to 15 minutes.
 
-### Locally (needs Chrome; Selenium Manager fetches a matching driver)
+### Locally, in a browser you signed in to (the mode that works)
+
+One-time setup on your computer (macOS or Linux, Chrome installed):
 
 ```bash
-export GADS_EMAIL='...' GADS_PASSWORD='...' GADS_TOTP_SECRET='...' GADS_REPORT_URL='...'
-export SUPABASE_URL='...' SUPABASE_SERVICE_ROLE_KEY='...'
+git clone https://github.com/abdullahnadeem-cell/call-details-sync && cd call-details-sync
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env     # then fill in SUPABASE_SERVICE_ROLE_KEY and GADS_REPORT_URL
+```
+
+`.env` is git-ignored and read automatically (the real environment wins over it). Then sign in
+once, either way:
+
+- **Saved session (headless afterwards).** A visible Chrome opens on the report; sign in by hand
+  (password, 2FA, any "verify it's you"); when the report loads the cookies are written to
+  `gads_session.json` (git-ignored) and every later run reuses them without any scripted login:
+
+  ```bash
+  python scripts/login_once.py
+  ```
+
+- **Your own signed-in Chrome window (attach).** A dedicated Chrome profile, signed in by hand once,
+  then started with a DevTools port that the sync attaches to; the sync works in a new tab and
+  closes only that tab:
+
+  ```bash
+  scripts/chrome.sh signin     # sign in, open the Call details report once, then
+  scripts/chrome.sh start      # prints GADS_CHROME_DEBUG_URL=127.0.0.1:9333 -> put it in .env
+  ```
+
+Then:
+
+```bash
 python -m src.run --date 2026-11-20 --dry-run        # browser + parse, no DB write, JSON in out/
 ```
 
@@ -172,17 +212,23 @@ python -m src.run --dry-run --from-file tests/fixtures/call_details_sample.csv  
 
 Other flags: `--headed` shows the browser, `--lookback N`, `--out path.json`, `--no-reconcile`.
 `--from-file` accepts a CSV download from the report or a JSON list of raw rows (a previous
-dry-run file also works). Optional env: `GADS_PROFILE_DIR` (Chrome profile folder, default
-`.chrome-profile`), `CHROME_BINARY`, `CHROMEDRIVER_PATH` (override Selenium Manager).
+dry-run file also works). Optional env: `GADS_SESSION_FILE` (default `gads_session.json`),
+`GADS_CHROME_DEBUG_URL`, `GADS_PROFILE_DIR` (Chrome profile folder, default `.chrome-profile`),
+`CHROME_BINARY`, `CHROMEDRIVER_PATH` (override Selenium Manager). If Google shows a sign-in or
+verification page, the run stops with `SESSION_EXPIRED`: sign in again by hand (`login_once.py`
+or `chrome.sh signin`); nothing scripts around it.
 
 ### Backfill
 
+The end date can be at most today in the account time zone (Google greys out future days; the
+run refuses a later date). Ranges over 7 days load one day per page.
+
 ```bash
-python -m src.run --from 2026-11-01 --to $(TZ=Pacific/Honolulu date -d 'yesterday' +%F)
+python -m src.run --from 2026-11-01 --to $(TZ=America/Los_Angeles date +%F)      # macOS: same command
 ```
 
-or run the workflow with `from=2026-11-01`, `to=<yesterday>`. Re-running any part of
-the range is safe.
+Re-running any part of the range is safe: rows are upserted on `call_key`, so the row count does
+not change on a second pass.
 
 ### Loading rows through SQL instead of the REST key
 
@@ -230,7 +276,7 @@ column except `caller_phone_raw`. Headers are matched by name (internal names su
 `CallStartTime` and UI labels such as "Start time"), with a positional fallback in the
 report's column order; the log warns when the fallback is used.
 
-## 5. Session reuse
+## 5. Session reuse (GitHub Actions)
 
 Google challenges fresh logins from new machines far more often than returning browsers.
 The job therefore keeps a Chrome profile (`.chrome-profile/`, cookies included) and carries

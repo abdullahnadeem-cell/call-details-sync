@@ -145,3 +145,10 @@ def test_saved_session_alone_satisfies_preflight(tmp_path, monkeypatch):
     monkeypatch.setattr(run, "collect_rows", fake_collect)
     assert run.main(["--date", "2026-11-20", "--dry-run", "--no-reconcile"]) == 0
     assert seen["session"]
+
+
+def test_future_end_date_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    rc = run.main(["--from", "2026-11-01", "--to", "2099-01-01", "--dry-run", "--from-file", FIXTURE])
+    assert rc == 2
+    assert (tmp_path / "debug" / "error_code.txt").read_text() == "CONFIG_ERROR"

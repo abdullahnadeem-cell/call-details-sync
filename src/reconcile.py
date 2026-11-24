@@ -6,17 +6,19 @@ from datetime import datetime
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from .dates import HST
+from .dates import ACCOUNT_TZ_DEFAULT
 
 
-def call_day_hst(start_time_iso: str) -> str:
-    return datetime.fromisoformat(start_time_iso).astimezone(ZoneInfo(HST)).date().isoformat()
+def call_day(start_time_iso: str, tz: str = ACCOUNT_TZ_DEFAULT) -> str:
+    """Calendar day of a call in the Google Ads account time zone (what the report and
+    gads_campaign_metrics use). The DB's call_date_hst is Hawaii on purpose and is separate."""
+    return datetime.fromisoformat(start_time_iso).astimezone(ZoneInfo(tz)).date().isoformat()
 
 
-def group_by_day_and_campaign(rows: list[dict]) -> dict[str, Counter]:
+def group_by_day_and_campaign(rows: list[dict], tz: str = ACCOUNT_TZ_DEFAULT) -> dict[str, Counter]:
     out: dict[str, Counter] = defaultdict(Counter)
     for r in rows:
-        out[call_day_hst(r["start_time"])][r.get("campaign") or "(no campaign)"] += 1
+        out[call_day(r["start_time"], tz)][r.get("campaign") or "(no campaign)"] += 1
     return out
 
 
@@ -28,9 +30,9 @@ def format_table(headers: list[str], body: list[list]) -> str:
     return "\n".join(lines)
 
 
-def print_reconciliation(rows: list[dict], days: list[str], sink, log: Callable[[str], None] = print) -> None:
+def print_reconciliation(rows: list[dict], days: list[str], sink, log: Callable[[str], None] = print, tz: str = ACCOUNT_TZ_DEFAULT) -> None:
     """For each synced day: calls in the report per campaign vs phone_calls in gads_campaign_metrics."""
-    by_day = group_by_day_and_campaign(rows)
+    by_day = group_by_day_and_campaign(rows, tz)
     for day in days:
         try:
             metrics = sink.phone_calls_by_campaign(day) if sink else {}
@@ -46,7 +48,7 @@ def print_reconciliation(rows: list[dict], days: list[str], sink, log: Callable[
         if sink:
             stored = sink.stored_count_for_day(day)
             if stored is not None:
-                log(f"[reconcile] {day}: rows now stored in google_ads_call_details = {stored}")
+                log(f"[reconcile] rows stored with call_date_hst = {day} (Hawaii day, may differ from the account-tz day above): {stored}")
     masked = [r for r in rows if (r.get("caller_phone_raw") or "").strip() in {"--", ""}]
     log(f"\n[reconcile] rows with caller_phone_raw '--' or empty: {len(masked)} (these have no number to link)")
     for r in masked:

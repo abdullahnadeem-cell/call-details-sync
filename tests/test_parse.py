@@ -166,3 +166,29 @@ def test_csv_without_preamble_and_tsv():
 def test_csv_without_header_fails():
     with pytest.raises(SyncError):
         parse.rows_from_csv_text("just,some,cells\n1,2,3\n")
+
+
+PACIFIC = "America/Los_Angeles"
+
+
+def test_account_timezone_is_pacific_known_point():
+    # confirmed against the Ads UI: a call shown as Nov 6 12:00 PM Pacific is 2026-11-06T20:00:00Z (PST, UTC-8)
+    dt = parse.parse_start_time("Nov 6, 2026, 12:00:00 PM", PACIFIC)
+    assert parse.utc_iso(dt) == "2026-11-06T20:00:00+00:00"
+    assert dt.isoformat() == "2026-11-06T12:00:00-08:00"
+
+
+def test_pacific_daylight_saving_and_seconds_kept():
+    # US daylight saving ended 2026-11-01 02:00: Oct 31 noon is PDT (UTC-7), Nov 1 noon is already PST (UTC-8)
+    assert parse.utc_iso(parse.parse_start_time("Oct 31, 2026, 12:34:56 PM", PACIFIC)) == "2026-10-31T19:34:56+00:00"
+    assert parse.utc_iso(parse.parse_start_time("Nov 1, 2026, 12:34:56 PM", PACIFIC)) == "2026-11-01T20:34:56+00:00"
+    assert parse.utc_iso(parse.parse_start_time("Nov 3, 2026, 12:34:56 PM", PACIFIC)) == "2026-11-03T20:34:56+00:00"
+
+
+def test_call_key_changes_with_account_timezone():
+    row = {"Start time": "Nov 6, 2026, 12:00:00 PM", "Duration": "0:18", "Caller ID": "+1 808-555-0100", "Campaign": "TCA Device Solutions"}
+    mapping = parse.map_headers(list(row), warn=lambda m: None)
+    pacific = parse.normalize_row(row, mapping, PACIFIC)
+    hawaii = parse.normalize_row(row, mapping, "Pacific/Honolulu")
+    assert pacific["start_time"] == "2026-11-06T12:00:00-08:00"
+    assert pacific["call_key"] != hawaii["call_key"]

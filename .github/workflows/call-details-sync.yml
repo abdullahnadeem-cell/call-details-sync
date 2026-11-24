@@ -46,7 +46,7 @@ jobs:
       GADS_REPORT_URL: ${{ secrets.GADS_REPORT_URL }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      GADS_ACCOUNT_TZ: ${{ vars.GADS_ACCOUNT_TZ || 'Pacific/Honolulu' }}
+      GADS_ACCOUNT_TZ: ${{ vars.GADS_ACCOUNT_TZ || 'America/Los_Angeles' }}
       GADS_PROFILE_DIR: ${{ vars.GADS_PROFILE_DIR || '.chrome-profile' }}
       PYTHONUNBUFFERED: "1"
     steps:

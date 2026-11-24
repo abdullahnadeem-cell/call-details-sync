@@ -133,6 +133,7 @@ class ReportScraper:
         accounts_url: str | None = None,
         session_cookies: list[dict] | None = None,
         proxy_url: str | None = None,
+        chrome_debug_url: str | None = None,
     ):
         self.report_url = report_url
         self.account_tz = account_tz
@@ -146,6 +147,8 @@ class ReportScraper:
         self.accounts_url = accounts_url
         self.session_cookies = session_cookies or []
         self.proxy_url = proxy_url
+        self.chrome_debug_url = chrome_debug_url
+        self._attached = bool(chrome_debug_url)
         self.driver: webdriver.Chrome | None = None
         self.login_method: str | None = None
         self.session_outcome: str | None = None  # accepted | rejected | not-used
@@ -170,13 +173,28 @@ class ReportScraper:
 
     def __exit__(self, *exc) -> None:
         try:
-            if self.driver:
+            if self.driver and self._attached:
+                self.driver.close()  # only our tab; the person's Chrome stays open
+            elif self.driver:
                 self.driver.quit()
         except Exception:  # noqa: BLE001
             pass
 
     def _build_driver(self) -> webdriver.Chrome:
         opts = Options()
+        if self._attached:
+            # attach to a Chrome the person signed in to (scripts/chrome.sh start); no profile,
+            # prefs or headless flags apply to a running browser, but DevTools commands still do
+            addr = re.sub(r"^https?://", "", self.chrome_debug_url).rstrip("/")
+            opts.add_experimental_option("debuggerAddress", addr)
+            driver_path = os.environ.get("CHROMEDRIVER_PATH")
+            driver = webdriver.Chrome(service=Service(driver_path) if driver_path else Service(), options=opts)
+            driver.switch_to.new_window("tab")
+            driver.set_page_load_timeout(self.timeout_ms / 1000)
+            driver.set_script_timeout(30)
+            self._apply_cdp(driver)
+            self.log(f"[scrape] attached to running Chrome at {addr}")
+            return driver
         if self.headless:
             opts.add_argument("--headless=new")
         opts.add_argument("--window-size=1600,1000")
@@ -211,6 +229,10 @@ class ReportScraper:
         driver = webdriver.Chrome(service=service, options=opts)
         driver.set_page_load_timeout(self.timeout_ms / 1000)
         driver.set_script_timeout(30)
+        self._apply_cdp(driver)
+        return driver
+
+    def _apply_cdp(self, driver: webdriver.Chrome) -> None:
         try:
             driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": self.account_tz})
         except WebDriverException as exc:
@@ -221,7 +243,6 @@ class ReportScraper:
                 break
             except WebDriverException:
                 continue
-        return driver
 
     # -- public ------------------------------------------------------------
     def fetch(self, start: date, end: date) -> ScrapeResult:
