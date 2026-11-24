@@ -119,6 +119,16 @@ def inspect(driver) -> ScreenInfo:
     )
 
 
+def challenge_reason(info: ScreenInfo) -> str:
+    """Short, credential-free description of why a screen counts as a challenge (for logs)."""
+    if info.has_captcha:
+        return "captcha"
+    if info.has_sms_input:
+        return "sms/phone code field"
+    m = CHALLENGE_RE.search(info.text)
+    return f"text matched {m.group(0)!r}" if m else "unrecognised"
+
+
 def classify_screen(info: ScreenInfo, totp_attempted: bool = False) -> str:
     """Decide which sign-in screen is showing. Pure function, unit tested on saved snippets."""
     text = info.text
@@ -131,12 +141,18 @@ def classify_screen(info: ScreenInfo, totp_attempted: bool = False) -> str:
         return DISMISSIBLE
     if TRY_ANOTHER_RE.search(text) and re.search(r"authenticator", text, re.I) and not (info.has_password_input or info.has_email_input or info.has_totp_input):
         return TRY_ANOTHER_WAY
-    if info.has_captcha or info.has_sms_input or CHALLENGE_RE.search(text):
+    if info.has_captcha or info.has_sms_input:
         return CHALLENGE
-    if info.has_totp_input or (TOTP_RE.search(text) and not info.has_password_input and not info.has_email_input):
+    # a real password / code field wins over challenge-like wording: Google's password page
+    # itself says "To continue, first verify it's you"
+    if info.has_totp_input:
         return TOTP
     if info.has_password_input:
         return PASSWORD
+    if CHALLENGE_RE.search(text):
+        return CHALLENGE
+    if TOTP_RE.search(text) and not info.has_email_input:
+        return TOTP
     if info.has_email_input:
         return EMAIL
     if CHOOSER_RE.search(text):
@@ -315,7 +331,9 @@ def ensure_logged_in(
                 continue
         if screen == CHALLENGE:
             _dump(driver, debug_dir, "challenge", log)
-            raise SyncError(LOGIN_CHALLENGE, "Google asked for a verification a script cannot answer (phone, passkey, captcha or 'verify it's you'); see debug screenshot")
+            path = urlparse(info.url).path
+            heading = info.text[:160]
+            raise SyncError(LOGIN_CHALLENGE, f"Google asked for a verification a script cannot answer ({challenge_reason(info)}; page path {path!r}; page starts {heading!r})")
         if screen == EMAIL:
             if not _type(driver, ('input[type="email"]', 'input[name="identifier"]', "#identifierId"), creds.email):
                 raise SyncError(LOGIN_CHALLENGE, "email field not usable")

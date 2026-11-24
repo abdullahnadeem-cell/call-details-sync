@@ -70,6 +70,7 @@ def info_from(name: str, url: str = "https://accounts.google.com/v3/signin/ident
         ("email.html", "https://accounts.google.com/v3/signin/identifier", gl.EMAIL),
         ("password.html", "https://accounts.google.com/v3/signin/challenge/pwd", gl.PASSWORD),
         ("password_wrong.html", "https://accounts.google.com/v3/signin/challenge/pwd", gl.BAD_CREDENTIALS),
+        ("password_verify_wording.html", "https://accounts.google.com/v3/signin/challenge/pwd", gl.PASSWORD),
         ("totp.html", "https://accounts.google.com/v3/signin/challenge/totp", gl.TOTP),
         ("challenge_phone.html", "https://accounts.google.com/v3/signin/challenge/ipp", gl.CHALLENGE),
         ("challenge_tap.html", "https://accounts.google.com/v3/signin/challenge/dp", gl.CHALLENGE),
@@ -132,3 +133,9 @@ def test_signed_out_url_and_ads_access():
     assert gl.ads_access_problem("https://ads.google.com/aw/overview", "Choose an account to continue") is not None
     assert gl.ads_access_problem("https://ads.google.com/aw/overview", "You don't have access to this account") is not None
     assert gl.ads_access_problem("https://ads.google.com/aw/reporteditor/view", "Call details 1 - 4 of 4") is None
+
+
+def test_challenge_reason_is_credential_free():
+    info = info_from("challenge_insecure.html", "https://accounts.google.com/v3/signin/rejected")
+    assert "browser or app may not be secure" in gl.challenge_reason(info)
+    assert gl.challenge_reason(info_from("captcha.html")) == "captcha"
