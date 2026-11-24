@@ -35,7 +35,7 @@ def test_dry_run_from_csv_file(tmp_path, monkeypatch, capsys):
     assert rows[0]["caller_phone_raw"] == "+1 808-688-3603"
     printed = capsys.readouterr().out
     assert "nothing written to Supabase" in printed
-    assert "+1 808-688-3603" in printed
+    assert "***3603" in printed and "+1 808-688-3603" not in printed
     assert "caller_phone_raw '--' or empty: 1" in printed
     assert not (tmp_path / "debug" / "error_code.txt").exists()
 
@@ -90,7 +90,8 @@ def test_real_run_uses_sink_and_dedupes(tmp_path, monkeypatch):
 def test_scrape_failure_writes_error_code(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("GADS_REPORT_URL", "https://ads.google.com/aw/reporteditor/view?reportState=x")
-    (tmp_path / "storage_state.json").write_text("{}")
+    monkeypatch.setenv("GADS_EMAIL", "x@example.com")
+    monkeypatch.setenv("GADS_PASSWORD", "pw")
 
     def boom(cfg, start, end, headed):
         raise SyncError("SESSION_EXPIRED", "landed on accounts.google.com")
@@ -107,3 +108,23 @@ def test_assert_rows_in_range():
     with pytest.raises(SyncError) as e:
         run.assert_rows_in_range(rows, date(2026, 11, 20), date(2026, 11, 20), "Pacific/Honolulu")
     assert e.value.code == "DATE_RANGE_MISMATCH"
+
+
+def test_missing_login_secrets_is_reported_by_name(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GADS_REPORT_URL", "https://ads.google.com/aw/reporteditor/view?reportState=x")
+    for name in ("GADS_EMAIL", "GADS_PASSWORD", "GADS_TOTP_SECRET"):
+        monkeypatch.delenv(name, raising=False)
+    rc = run.main(["--date", "2026-11-20", "--dry-run"])
+    assert rc == 2
+    assert (tmp_path / "debug" / "error_code.txt").read_text() == "MISSING_SECRETS"
+    out = capsys.readouterr().out
+    assert "GADS_EMAIL" in out and "GADS_PASSWORD" in out
+
+
+def test_dry_run_masks_phone_numbers(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    rc = run.main(["--date", "2026-11-20", "--dry-run", "--from-file", FIXTURE, "--out", str(tmp_path / "r.json"), "--no-reconcile"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "***3603" in out and "808-688-3603" not in out

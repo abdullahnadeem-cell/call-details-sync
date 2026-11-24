@@ -1,16 +1,18 @@
-"""Drive Chromium to read the saved "Call details" report for a date range.
+"""Drive Chrome (Selenium) to read the saved "Call details" report for a date range.
 
 Flow per date range:
   1. open the report URL with the range rewritten in reportState (report_url.py)
-  2. refuse to continue on any Google sign in / verification page -> SESSION_EXPIRED
+  2. refuse to continue on any Google sign in / verification page (SESSION_EXPIRED,
+     after one self-login retry when credentials are configured)
   3. wait for the report grid (or its "no data" message) -> else TABLE_NOT_RENDERED
-  4. verify the date range the page shows; if the URL rewrite was ignored, set
-     it through the date picker and verify again -> else DATE_RANGE_MISMATCH
+  4. verify the date range the page shows (grid text removed); if the URL rewrite
+     was ignored, set it through the date picker and verify again -> DATE_RANGE_MISMATCH
   5. read rows: the report's Download > .csv first, grid scraping as fallback
   6. compare the row count with the total the page reports -> ROWCOUNT_MISMATCH
 
-Role/text based locators only. A screenshot and the page HTML land in
-``debug/`` on any failure. Cookie values are never logged.
+Controls are found by visible text and aria-label (XPath), never by generated
+class names. Plain Selenium, no stealth tricks. A screenshot and the page HTML
+land in ``debug/`` only on failure. Phone numbers are never logged.
 """
 from __future__ import annotations
 
@@ -22,7 +24,12 @@ from datetime import date
 from pathlib import Path
 from typing import Callable
 
-from playwright.sync_api import Browser, BrowserContext, Download, Locator, Page, TimeoutError as PWTimeout, sync_playwright
+from selenium import webdriver
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 
 from .errors import (
     DATE_RANGE_MISMATCH,
@@ -32,15 +39,10 @@ from .errors import (
     TABLE_NOT_RENDERED,
     SyncError,
 )
+from .google_login import Credentials, assert_ads_access, ensure_logged_in, is_signed_out_url
 from .parse import REPORT_COLUMNS, map_headers, rows_from_csv_text
 from .report_url import build_report_url
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
-SIGNIN_HOSTS = ("accounts.google.com", "accounts.youtube.com", "myaccount.google.com")
-SIGNIN_URL_HINTS = ("/signin", "/ServiceLogin", "/challenge", "/speedbump", "/v3/signin", "InteractiveLogin")
 SIGNIN_TEXT = re.compile(
     r"verify it.s you|sign in to continue|choose an account|2-step verification|"
     r"couldn.t sign you in|use your google account|enter your password|confirm it.s you|"
@@ -55,6 +57,8 @@ NO_DATA_TEXT = re.compile(
 TOTAL_RE = re.compile(r"(\d[\d,]*)\s*[-–—]\s*(\d[\d,]*)\s*of\s*(\d[\d,]*)", re.I)
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 MONTHS_LONG = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+LOWER = "abcdefghijklmnopqrstuvwxyz"
+UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 
 @dataclass
@@ -68,13 +72,14 @@ class ScrapeResult:
 
 def expected_range_texts(start: date, end: date) -> list[str]:
     """Strings the page may show for the chosen range (en-US and ISO forms)."""
+
     def md(d: date, long=False) -> str:
         return f"{(MONTHS_LONG if long else MONTHS)[d.month - 1]} {d.day}"
 
     out: list[str] = []
     if start == end:
         for long in (False, True):
-            out += [f"{md(start, long)}, {start.year}"]
+            out.append(f"{md(start, long)}, {start.year}")
         out += [start.isoformat(), f"{start.month}/{start.day}/{start.year}", f"{start.month:02d}/{start.day:02d}/{start.year}"]
         return out
     for dash in ("–", "-", "—"):
@@ -103,96 +108,139 @@ def _host(url: str) -> str:
     return m.group(1).lower() if m else ""
 
 
+def xp_ci(label: str, tags: str = "*") -> str:
+    """XPath for elements whose normalized text or aria-label contains ``label`` (case-insensitive)."""
+    low = label.lower().replace('"', "")
+    return (
+        f"//{tags}[contains(translate(normalize-space(.), '{UPPER}', '{LOWER}'), \"{low}\")"
+        f" or contains(translate(@aria-label, '{UPPER}', '{LOWER}'), \"{low}\")]"
+    )
+
+
 class ReportScraper:
     def __init__(
         self,
         report_url: str,
-        storage_state_path: str,
         account_tz: str,
         headless: bool = True,
         debug_dir: str = "debug",
         downloads_dir: str = "downloads",
         timeout_ms: int = 90_000,
         log: Callable[[str], None] = print,
+        profile_dir: str | None = None,
+        credentials: Credentials | None = None,
+        accounts_url: str | None = None,
     ):
         self.report_url = report_url
-        self.storage_state_path = storage_state_path
         self.account_tz = account_tz
         self.headless = headless
         self.debug_dir = Path(debug_dir)
-        self.downloads_dir = Path(downloads_dir)
+        self.downloads_dir = Path(downloads_dir).resolve()
         self.timeout_ms = timeout_ms
         self.log = log
-        self._pw = None
-        self.browser: Browser | None = None
-        self.context: BrowserContext | None = None
+        self.profile_dir = profile_dir
+        self.credentials = credentials
+        self.accounts_url = accounts_url
+        self.driver: webdriver.Chrome | None = None
+        self.login_method: str | None = None
+        self._relogin_done = False
 
     # -- lifecycle ---------------------------------------------------------
     def __enter__(self) -> "ReportScraper":
         self.debug_dir.mkdir(parents=True, exist_ok=True)
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
-        self._pw = sync_playwright().start()
-        launch_kwargs = dict(headless=self.headless, args=["--disable-blink-features=AutomationControlled", "--lang=en-US"])
-        exe = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE")
-        if exe:
-            launch_kwargs["executable_path"] = exe
-        self.browser = self._pw.chromium.launch(**launch_kwargs)
-        self.context = self.browser.new_context(
-            storage_state=self.storage_state_path,
-            accept_downloads=True,
-            viewport={"width": 1600, "height": 1000},
-            locale="en-US",
-            timezone_id=self.account_tz,
-            user_agent=USER_AGENT,
-        )
-        self.context.set_default_timeout(self.timeout_ms)
+        self.driver = self._build_driver()
+        if self.credentials:
+            kwargs = {"accounts_url": self.accounts_url} if self.accounts_url else {}
+            self.login_method = ensure_logged_in(self.driver, self.credentials, log=self.log, debug_dir=self.debug_dir, **kwargs)
         return self
 
     def __exit__(self, *exc) -> None:
-        for closer in (lambda: self.context and self.context.close(), lambda: self.browser and self.browser.close(), lambda: self._pw and self._pw.stop()):
+        try:
+            if self.driver:
+                self.driver.quit()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _build_driver(self) -> webdriver.Chrome:
+        opts = Options()
+        if self.headless:
+            opts.add_argument("--headless=new")
+        opts.add_argument("--window-size=1600,1000")
+        opts.add_argument("--lang=en-US")
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--disable-gpu")
+        if self.profile_dir:
+            opts.add_argument(f"--user-data-dir={Path(self.profile_dir).resolve()}")
+        opts.add_experimental_option(
+            "prefs",
+            {
+                "download.default_directory": str(self.downloads_dir),
+                "download.prompt_for_download": False,
+                "download.directory_upgrade": True,
+                "safebrowsing.enabled": True,
+                "intl.accept_languages": "en-US,en",
+                "credentials_enable_service": False,
+                "profile.password_manager_enabled": False,
+            },
+        )
+        binary = os.environ.get("CHROME_BINARY")
+        if binary:
+            opts.binary_location = binary
+        driver_path = os.environ.get("CHROMEDRIVER_PATH")
+        service = Service(driver_path) if driver_path else Service()  # Selenium Manager otherwise
+        driver = webdriver.Chrome(service=service, options=opts)
+        driver.set_page_load_timeout(self.timeout_ms / 1000)
+        driver.set_script_timeout(30)
+        try:
+            driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": self.account_tz})
+        except WebDriverException as exc:
+            self.log(f"[scrape] could not set browser time zone: {type(exc).__name__}")
+        for cmd in ("Browser.setDownloadBehavior", "Page.setDownloadBehavior"):
             try:
-                closer()
-            except Exception:  # noqa: BLE001
-                pass
+                driver.execute_cdp_cmd(cmd, {"behavior": "allow", "downloadPath": str(self.downloads_dir)})
+                break
+            except WebDriverException:
+                continue
+        return driver
 
     # -- public ------------------------------------------------------------
     def fetch(self, start: date, end: date) -> ScrapeResult:
         label = start.isoformat() if start == end else f"{start}_{end}"
-        page = self.context.new_page()
         try:
             try:
-                return self._fetch(page, start, end, label)
+                return self._fetch(start, end, label)
             except SyncError:
                 raise
-            except PWTimeout as exc:
+            except TimeoutException as exc:
                 raise SyncError(TABLE_NOT_RENDERED, f"timed out while reading the report: {str(exc).splitlines()[0]}") from exc
         except SyncError as exc:
-            self._dump(page, f"{label}-{exc.code}")
+            self._dump(f"{label}-{exc.code}")
             raise
-        finally:
-            page.close()
 
     # -- steps -------------------------------------------------------------
-    def _fetch(self, page: Page, start: date, end: date, label: str) -> ScrapeResult:
+    def _fetch(self, start: date, end: date, label: str) -> ScrapeResult:
+        d = self.driver
         url = build_report_url(self.report_url, start, end)
-        self._goto_with_retry(page, url)
-        self._assert_signed_in(page)
-        self._wait_for_report(page)
-        self._assert_signed_in(page)
+        self._goto_with_retry(url)
+        self._assert_signed_in(url)
+        assert_ads_access(d, log=self.log)
+        self._wait_for_report()
+        self._assert_signed_in(url)
 
         date_method = "url"
-        if not self._range_matches(page, start, end):
+        if not self._range_matches(start, end):
             self.log("[scrape] page does not show the requested range after URL rewrite; trying the date picker")
-            self._set_range_via_ui(page, start, end)
-            self._wait_for_report(page)
-            if not self._range_matches(page, start, end):
-                shown = self._visible_date_like_text(page)
-                raise SyncError(DATE_RANGE_MISMATCH, f"page shows {shown!r}, wanted {start}..{end}")
+            self._set_range_via_ui(start, end)
+            self._wait_for_report()
+            if not self._range_matches(start, end):
+                raise SyncError(DATE_RANGE_MISMATCH, f"page shows {self._visible_date_like_text()!r}, wanted {start}..{end}")
             date_method = "ui"
         self.log(f"[scrape] date range {start}..{end} confirmed on page (set via {date_method})")
 
-        total = self._reported_total(page)
-        no_data = self._no_data_shown(page)
+        total = self._reported_total()
+        no_data = self._no_data_shown()
         if total is None and no_data:
             total = 0
         self.log(f"[scrape] page reports total={total} no_data_message={no_data}")
@@ -201,14 +249,14 @@ class ReportScraper:
         rows_method = "none"
         if total != 0:
             try:
-                rows = self._download_csv(page, label)
+                rows = self._download_csv(label)
                 rows_method = "csv"
             except Exception as exc:  # noqa: BLE001 - fall back to the grid
                 self.log(f"[scrape] CSV download not usable ({type(exc).__name__}: {str(exc).splitlines()[0][:200]}); scraping the grid")
-                rows = self._scrape_grid(page, total)
+                rows = self._scrape_grid(total)
                 rows_method = "grid"
         if total is None:
-            grid_rows = self._count_grid_rows(page)
+            grid_rows = self._count_grid_rows()
             if grid_rows is None and not rows and not no_data:
                 raise SyncError(TABLE_NOT_RENDERED, "no row total, no grid rows and no 'no data' message on the page")
             total = grid_rows if grid_rows is not None else len(rows)
@@ -217,99 +265,109 @@ class ReportScraper:
             raise SyncError(ROWCOUNT_MISMATCH, f"captured {len(rows)} row(s) via {rows_method} but the page reports {total}")
         return ScrapeResult(rows=rows, rows_method=rows_method, date_method=date_method, reported_total=total)
 
-    def _goto_with_retry(self, page: Page, url: str) -> None:
+    def _goto_with_retry(self, url: str) -> None:
         last: Exception | None = None
         for attempt in (1, 2):
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
-                try:
-                    page.wait_for_load_state("networkidle", timeout=45_000)
-                except PWTimeout:
-                    self.log("[scrape] network did not go idle in 45s; continuing")
+                self.driver.get(url)
+                self._wait_document_complete(45)
                 return
-            except PWTimeout as exc:
+            except TimeoutException as exc:
                 last = exc
                 self.log(f"[scrape] page load attempt {attempt} timed out")
-            except Exception as exc:  # noqa: BLE001
+            except WebDriverException as exc:
                 last = exc
-                self.log(f"[scrape] page load attempt {attempt} failed: {type(exc).__name__}: {str(exc).splitlines()[0]}")
+                self.log(f"[scrape] page load attempt {attempt} failed: {type(exc).__name__}: {str(exc).splitlines()[0][:200]}")
             time.sleep(5)
         raise SyncError(PAGE_LOAD_FAILED, f"could not load the report page: {type(last).__name__}")
 
-    def _assert_signed_in(self, page: Page) -> None:
-        url = page.url or ""
-        host = _host(url)
-        if any(host == h or host.endswith("." + h) for h in SIGNIN_HOSTS) or any(h.lower() in url.lower() for h in SIGNIN_URL_HINTS):
-            raise SyncError(SESSION_EXPIRED, f"landed on a Google sign in page ({host}); re-run scripts/login_once.py and update GADS_STORAGE_STATE")
-        try:
-            title = page.title() or ""
-        except Exception:  # noqa: BLE001
-            title = ""
-        if re.search(r"sign in|verify", title, re.I) and "ads.google.com/aw" not in url:
-            raise SyncError(SESSION_EXPIRED, f"page title {title!r} looks like a sign in page")
-        if self._signin_text_shown(page):
-            raise SyncError(SESSION_EXPIRED, "page asks to sign in or verify identity; re-run scripts/login_once.py and update GADS_STORAGE_STATE")
+    def _wait_document_complete(self, seconds: float) -> None:
+        end = time.time() + seconds
+        while time.time() < end:
+            try:
+                if self.driver.execute_script("return document.readyState") == "complete":
+                    return
+            except WebDriverException:
+                pass
+            time.sleep(0.5)
 
-    def _signin_text_shown(self, page: Page) -> bool:
-        body = self._body_text(page, limit=20_000)
-        return bool(SIGNIN_TEXT.search(body)) and not self._report_visible(page)
+    def _assert_signed_in(self, report_url: str) -> None:
+        url = self.driver.current_url or ""
+        signed_out = is_signed_out_url(url)
+        if not signed_out:
+            try:
+                title = self.driver.title or ""
+            except WebDriverException:
+                title = ""
+            if re.search(r"sign in|verify", title, re.I) and "ads.google.com/aw" not in url:
+                signed_out = True
+        if not signed_out and self._signin_text_shown():
+            signed_out = True
+        if not signed_out:
+            return
+        if self.credentials and not self._relogin_done:
+            self._relogin_done = True
+            self.log(f"[scrape] landed on a sign-in page at {_host(url)}; signing in with the configured account")
+            kwargs = {"accounts_url": self.accounts_url} if self.accounts_url else {}
+            self.login_method = ensure_logged_in(self.driver, self.credentials, log=self.log, debug_dir=self.debug_dir, **kwargs)
+            self._goto_with_retry(report_url)
+            if not is_signed_out_url(self.driver.current_url or "") and not self._signin_text_shown():
+                return
+        raise SyncError(SESSION_EXPIRED, f"landed on a Google sign in page ({_host(self.driver.current_url)}) instead of the report")
 
-    def _wait_for_report(self, page: Page) -> None:
+    def _wait_for_report(self) -> None:
         deadline = time.time() + self.timeout_ms / 1000
         while time.time() < deadline:
-            if self._report_visible(page) or self._no_data_shown(page) or self._reported_total(page) is not None:
-                page.wait_for_timeout(1500)  # let the grid finish painting
+            if self._report_visible() or self._no_data_shown() or self._reported_total() is not None:
+                time.sleep(1.5)  # let the grid finish painting
                 return
-            self._assert_signed_in(page)
-            page.wait_for_timeout(1000)
-        if self._signin_text_shown(page):
-            raise SyncError(SESSION_EXPIRED, "page asks to sign in or verify identity instead of showing the report")
+            if self._signin_text_shown() or is_signed_out_url(self.driver.current_url or ""):
+                raise SyncError(SESSION_EXPIRED, "page asks to sign in or verify identity instead of showing the report")
+            time.sleep(1)
         raise SyncError(TABLE_NOT_RENDERED, "report grid did not render and no 'no data' message appeared")
 
-    def _report_visible(self, page: Page) -> bool:
+    # -- page inspection ---------------------------------------------------
+    def _js(self, script: str, *args):
         try:
-            if self._grid_rows_locator(page).count() > 0:
-                return True
-            if page.get_by_role("columnheader").count() >= 3:
-                return True
-        except Exception:  # noqa: BLE001
-            return False
-        return False
+            return self.driver.execute_script(script, *args)
+        except WebDriverException:
+            return None
 
-    def _no_data_shown(self, page: Page) -> bool:
-        return bool(NO_DATA_TEXT.search(self._body_text(page)))
+    def _body_text(self, limit: int = 200_000) -> str:
+        text = self._js("return (document.body && document.body.innerText) || ''") or ""
+        return _squash(text)[:limit]
 
-    def _body_text(self, page: Page, limit: int = 200_000) -> str:
-        try:
-            return _squash(page.locator("body").inner_text(timeout=10_000))[:limit]
-        except Exception:  # noqa: BLE001
-            return ""
+    def _report_visible(self) -> bool:
+        n = self._js(
+            "return document.querySelectorAll('[role=row]:has([role=cell],[role=gridcell]), tr:has(td)').length"
+            " + (document.querySelectorAll('[role=columnheader]').length >= 3 ? 1 : 0)"
+        )
+        return bool(n)
 
-    def _chrome_text(self, page: Page) -> str:
-        """Page text with the report grid removed, so dates inside data rows cannot
-        pass for the date range control."""
-        try:
-            text = page.evaluate(
-                """() => {
-                  let out = document.body.innerText || '';
-                  for (const g of document.querySelectorAll('[role=grid],[role=treegrid],[role=table],table,[role=rowgroup]')) {
-                    const t = (g.innerText || '').trim();
-                    if (t) out = out.split(t).join(' ');
-                  }
-                  return out;
-                }"""
-            )
-            return _squash(text)
-        except Exception:  # noqa: BLE001
-            return self._body_text(page)
+    def _no_data_shown(self) -> bool:
+        return bool(NO_DATA_TEXT.search(self._body_text()))
 
-    def _range_matches(self, page: Page, start: date, end: date) -> bool:
-        chrome = self._chrome_text(page)
+    def _signin_text_shown(self) -> bool:
+        return bool(SIGNIN_TEXT.search(self._body_text(limit=20_000))) and not self._report_visible()
+
+    def _chrome_text(self) -> str:
+        """Page text with the report grid removed, so dates inside data rows cannot pass for the date control."""
+        text = self._js(
+            """let out = document.body.innerText || '';
+               for (const g of document.querySelectorAll('[role=grid],[role=treegrid],[role=table],table,[role=rowgroup]')) {
+                 const t = (g.innerText || '').trim();
+                 if (t) out = out.split(t).join(' ');
+               }
+               return out;"""
+        )
+        return _squash(text) if text is not None else self._body_text()
+
+    def _range_matches(self, start: date, end: date) -> bool:
+        chrome = self._chrome_text()
         hits = [t for t in expected_range_texts(start, end) if t in chrome]
         if hits:
             self.log(f"[scrape] range text on page: {hits[0]!r}")
             return True
-        # a single day may also be rendered as a range of the same day, e.g. "Nov 20 – 20, 2026"
         if start == end:
             for long in (False, True):
                 mon = (MONTHS_LONG if long else MONTHS)[start.month - 1]
@@ -317,132 +375,189 @@ class ReportScraper:
                     return True
         return False
 
-    def _visible_date_like_text(self, page: Page) -> str:
-        body = self._chrome_text(page)
+    def _visible_date_like_text(self) -> str:
+        body = self._chrome_text()
         m = re.findall(r"(?:" + "|".join(MONTHS) + r")[a-z]* \d{1,2}(?:, \d{4})?(?:\s*[-–—]\s*(?:(?:" + "|".join(MONTHS) + r")[a-z]* )?\d{1,2}(?:, \d{4})?)?", body)
         return "; ".join(m[:5])
 
-    def _set_range_via_ui(self, page: Page, start: date, end: date) -> None:
-        """Best effort: open the date picker, choose Custom, type both dates, Apply."""
-        picker = page.get_by_role("button", name=re.compile(r"\d{4}|date range|custom", re.I)).first
-        picker.click(timeout=15_000)
-        page.wait_for_timeout(800)
-        custom = page.get_by_role("menuitem", name=re.compile(r"^custom", re.I)).or_(page.get_by_text(re.compile(r"^custom$", re.I)))
-        if custom.count():
-            custom.first.click(timeout=10_000)
-            page.wait_for_timeout(500)
-        start_box = page.get_by_role("textbox", name=re.compile(r"start", re.I)).first
-        end_box = page.get_by_role("textbox", name=re.compile(r"end", re.I)).first
-        for box, d in ((start_box, start), (end_box, end)):
-            box.click(timeout=10_000)
-            box.press("Control+A")
-            box.fill(f"{MONTHS[d.month - 1]} {d.day}, {d.year}")
-            box.press("Tab")
-        page.get_by_role("button", name=re.compile(r"^apply$", re.I)).first.click(timeout=10_000)
-        try:
-            page.wait_for_load_state("networkidle", timeout=30_000)
-        except PWTimeout:
-            pass
-
-    def _reported_total(self, page: Page) -> int | None:
-        body = self._body_text(page)
-        matches = TOTAL_RE.findall(body)
+    def _reported_total(self) -> int | None:
+        matches = TOTAL_RE.findall(self._body_text())
         if not matches:
             return None
-        totals = {_int(m[2]) for m in matches}
-        # the report grid's paginator; if several paginators exist, prefer the largest plausible total
-        return max(totals)
+        return max(_int(m[2]) for m in matches)
 
-    # -- rows: CSV download ---------------------------------------------------
-    def _download_csv(self, page: Page, label: str) -> list[dict]:
-        button = page.get_by_role("button", name=re.compile(r"download", re.I))
-        if button.count() == 0:
-            button = page.get_by_label(re.compile(r"download", re.I))
-        if button.count() == 0:
+    # -- locating controls -------------------------------------------------
+    def _visible(self, xpath: str):
+        for el in self.driver.find_elements(By.XPATH, xpath):
+            try:
+                if el.is_displayed():
+                    return el
+            except WebDriverException:
+                continue
+        return None
+
+    def _click(self, el) -> None:
+        self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+        try:
+            el.click()
+        except WebDriverException:
+            self.driver.execute_script("arguments[0].click();", el)
+
+    def _wait_visible(self, xpath: str, seconds: float):
+        end = time.time() + seconds
+        while time.time() < end:
+            el = self._visible(xpath)
+            if el is not None:
+                return el
+            time.sleep(0.3)
+        return None
+
+    # -- date picker fallback ----------------------------------------------
+    def _set_range_via_ui(self, start: date, end: date) -> None:
+        """Best effort: open the date picker, choose Custom, type both dates, Apply."""
+        picker = (
+            self._visible(xp_ci("date range", "*[self::button or @role='button']"))
+            or self._visible(f"//*[self::button or @role='button'][contains(normalize-space(.), '{start.year}') or contains(normalize-space(.), '{end.year}') or contains(normalize-space(.), '2026')]")
+        )
+        if picker is None:
+            raise SyncError(DATE_RANGE_MISMATCH, "could not find the date range control")
+        self._click(picker)
+        time.sleep(0.8)
+        custom = self._visible(xp_ci("custom", "*[self::li or self::button or @role='menuitem' or @role='option' or @role='button' or @role='radio']"))
+        if custom is not None:
+            self._click(custom)
+            time.sleep(0.5)
+        def field_xpath(word: str) -> str:
+            return (
+                xp_ci(word, "input")
+                + f" | //label[contains(translate(normalize-space(.), '{UPPER}', '{LOWER}'), '{word}')]//input"
+                + f" | //input[@id=//label[contains(translate(normalize-space(.), '{UPPER}', '{LOWER}'), '{word}')]/@for]"
+            )
+
+        start_box = self._wait_visible(field_xpath("start"), 5)
+        end_box = next((el for el in self.driver.find_elements(By.XPATH, field_xpath("end")) if el.is_displayed() and el != start_box), None)
+        if start_box is None or end_box is None:
+            raise SyncError(DATE_RANGE_MISMATCH, "date picker start/end fields not found")
+        for box, dd in ((start_box, start), (end_box, end)):
+            self._click(box)
+            box.send_keys(Keys.CONTROL, "a")
+            box.send_keys(f"{MONTHS[dd.month - 1]} {dd.day}, {dd.year}")
+            box.send_keys(Keys.TAB)
+        apply_btn = self._visible(xp_ci("apply", "*[self::button or @role='button']"))
+        if apply_btn is None:
+            raise SyncError(DATE_RANGE_MISMATCH, "date picker Apply button not found")
+        self._click(apply_btn)
+        self._wait_document_complete(30)
+        time.sleep(1.5)
+
+    # -- rows: CSV download ------------------------------------------------
+    def _download_csv(self, label: str) -> list[dict]:
+        before = {p.name for p in self.downloads_dir.iterdir()}
+        button = self._visible(xp_ci("download", "*[self::button or @role='button' or self::a]"))
+        if button is None:
             raise RuntimeError("no Download button found")
-        button.first.click(timeout=15_000)
-        page.wait_for_timeout(600)
-        item = page.get_by_role("menuitem", name=re.compile(r"^\s*\.?csv\s*$", re.I))
-        if item.count() == 0:
-            item = page.get_by_role("menuitem", name=re.compile(r"csv", re.I)).filter(has_not_text=re.compile("excel", re.I))
-        if item.count() == 0:
-            item = page.get_by_role("menuitem", name=re.compile(r"csv", re.I))
-        if item.count() == 0:
-            item = page.get_by_text(re.compile(r"^\s*\.?csv\s*$", re.I))
-        if item.count() == 0:
-            page.keyboard.press("Escape")
+        self._click(button)
+        time.sleep(0.6)
+        item = None
+        for xp in (
+            "//*[@role='menuitem' or @role='option' or self::li][translate(normalize-space(.), 'CSV.', 'csv')='csv']",
+            "//*[@role='menuitem' or @role='option' or self::li][contains(translate(normalize-space(.), 'CSV', 'csv'), 'csv') and not(contains(translate(normalize-space(.), 'EXCEL', 'excel'), 'excel'))]",
+            "//*[@role='menuitem' or @role='option' or self::li][contains(translate(normalize-space(.), 'CSV', 'csv'), 'csv')]",
+            "//*[translate(normalize-space(.), 'CSV.', 'csv')='csv']",
+        ):
+            item = self._wait_visible(xp, 3)
+            if item is not None:
+                break
+        if item is None:
+            self.driver.switch_to.active_element.send_keys(Keys.ESCAPE)
             raise RuntimeError("no CSV option in the Download menu")
-        with page.expect_download(timeout=60_000) as dl_info:
-            item.first.click(timeout=10_000)
-        download: Download = dl_info.value
+        self._click(item)
+        path = self._wait_for_download(before, timeout=60)
         target = self.downloads_dir / f"call_details_{label}.csv"
-        download.save_as(str(target))
+        if path != target:
+            if target.exists():
+                target.unlink()
+            path.rename(target)
         data = target.read_bytes()
         text = data.decode("utf-16") if data[:2] in (b"\xff\xfe", b"\xfe\xff") else data.decode("utf-8-sig")
         rows = rows_from_csv_text(text)
         self.log(f"[scrape] CSV download: {len(rows)} data row(s), headers={list(rows[0].keys()) if rows else 'n/a'}")
         return rows
 
-    # -- rows: grid scraping ---------------------------------------------------
-    def _grid_rows_locator(self, page: Page) -> Locator:
-        return page.get_by_role("row").filter(has=page.get_by_role("cell").or_(page.get_by_role("gridcell")))
+    def _wait_for_download(self, before: set[str], timeout: float) -> Path:
+        end = time.time() + timeout
+        last_size = -1
+        candidate: Path | None = None
+        while time.time() < end:
+            new = [p for p in self.downloads_dir.iterdir() if p.name not in before]
+            finished = [p for p in new if not p.name.endswith((".crdownload", ".tmp", ".part"))]
+            if finished:
+                candidate = max(finished, key=lambda p: p.stat().st_mtime)
+                size = candidate.stat().st_size
+                if size > 0 and size == last_size:
+                    return candidate
+                last_size = size
+            time.sleep(0.5)
+        raise RuntimeError("download did not finish in time")
 
-    def _count_grid_rows(self, page: Page) -> int | None:
-        try:
-            n = self._grid_rows_locator(page).count()
-            return n if n > 0 else None
-        except Exception:  # noqa: BLE001
-            return None
+    # -- rows: grid scraping -----------------------------------------------
+    def _count_grid_rows(self) -> int | None:
+        n = self._js("return document.querySelectorAll('[role=row]:has([role=cell],[role=gridcell]), tr:has(td)').length")
+        return n if n else None
 
-    def _grid_headers(self, page: Page) -> list[str]:
-        headers = [h.strip() for h in page.get_by_role("columnheader").all_inner_texts()]
-        headers = [_squash(h) for h in headers if h.strip()]
-        if not headers:
-            headers = [f"col{i}" for i in range(len(REPORT_COLUMNS))]
-        return headers
+    def _grid_headers(self) -> list[str]:
+        headers = self._js(
+            "return Array.from(document.querySelectorAll('[role=columnheader], th')).map(h => (h.innerText||'').trim()).filter(Boolean)"
+        ) or []
+        headers = [_squash(h) for h in headers]
+        return headers or [f"col{i}" for i in range(len(REPORT_COLUMNS))]
 
-    def _maximize_rows_per_page(self, page: Page) -> None:
-        combo = page.get_by_role("combobox", name=re.compile(r"rows per page|show rows|page size", re.I))
-        if combo.count() == 0:
-            combo = page.get_by_role("button", name=re.compile(r"rows per page|show rows", re.I))
-        if combo.count() == 0:
+    def _maximize_rows_per_page(self) -> None:
+        combo = self._visible(xp_ci("rows per page", "*[@role='combobox' or @role='button' or self::button or self::select]")) or self._visible(
+            xp_ci("show rows", "*[@role='combobox' or @role='button' or self::button or self::select]")
+        )
+        if combo is None:
             return
         try:
-            combo.first.click(timeout=5_000)
-            options = page.get_by_role("option")
-            if options.count() == 0:
-                options = page.get_by_role("menuitem")
+            if combo.tag_name.lower() == "select":
+                from selenium.webdriver.support.ui import Select
+
+                sel = Select(combo)
+                best = max((o for o in sel.options if o.text.strip().replace(",", "").isdigit()), key=lambda o: int(o.text.strip().replace(",", "")), default=None)
+                if best is not None:
+                    sel.select_by_visible_text(best.text)
+                    self.log(f"[scrape] rows per page set to {best.text.strip()}")
+                return
+            self._click(combo)
+            time.sleep(0.8)
+            options = [o for o in self.driver.find_elements(By.XPATH, "//*[@role='option' or @role='menuitem' or self::li]") if o.is_displayed()]
             best, best_val = None, -1
-            for i in range(options.count()):
-                txt = options.nth(i).inner_text().strip().replace(",", "")
+            for o in options:
+                txt = o.text.strip().replace(",", "")
                 if txt.isdigit() and int(txt) > best_val:
-                    best, best_val = options.nth(i), int(txt)
+                    best, best_val = o, int(txt)
             if best is not None:
-                best.click(timeout=5_000)
-                page.wait_for_timeout(1500)
+                self._click(best)
+                time.sleep(1.5)
                 self.log(f"[scrape] rows per page set to {best_val}")
             else:
-                page.keyboard.press("Escape")
-        except Exception as exc:  # noqa: BLE001
+                self.driver.switch_to.active_element.send_keys(Keys.ESCAPE)
+        except WebDriverException as exc:
             self.log(f"[scrape] could not change rows per page: {type(exc).__name__}")
-            page.keyboard.press("Escape")
 
-    def _read_visible_rows(self, page: Page) -> list[list[dict]]:
-        """Each row as a list of {text, href} cells, read in one evaluate call."""
-        return page.evaluate(
-            """() => {
-              const rows = Array.from(document.querySelectorAll('[role=row], tr'))
-                .filter(r => r.querySelector('[role=cell], [role=gridcell], td'));
-              return rows.map(r => Array.from(r.querySelectorAll('[role=cell], [role=gridcell], td')).map(c => {
-                const a = c.querySelector('a[href]');
-                return { text: (c.innerText || '').replace(/\\s+/g, ' ').trim(), href: a ? a.href : null };
-              }));
-            }"""
-        )
+    def _read_visible_rows(self) -> list[list[dict]]:
+        return self._js(
+            """const rows = Array.from(document.querySelectorAll('[role=row], tr'))
+                 .filter(r => r.querySelector('[role=cell], [role=gridcell], td'));
+               return rows.map(r => Array.from(r.querySelectorAll('[role=cell], [role=gridcell], td')).map(c => {
+                 const a = c.querySelector('a[href]');
+                 return { text: (c.innerText || '').replace(/\\s+/g, ' ').trim(), href: a ? a.href : null };
+               }));"""
+        ) or []
 
-    def _scrape_grid(self, page: Page, total: int | None) -> list[dict]:
-        self._maximize_rows_per_page(page)
-        headers = self._grid_headers(page)
+    def _scrape_grid(self, total: int | None) -> list[dict]:
+        self._maximize_rows_per_page()
+        headers = self._grid_headers()
         mapping = map_headers(headers, warn=self.log) if len(headers) >= 2 else {}
         recording_header = next((h for h, c in mapping.items() if c == "recording_url"), None)
         collected: dict[str, dict] = {}
@@ -452,7 +567,7 @@ class ReportScraper:
             stable = 0
             last_count = -1
             for _ in range(200):  # virtualized rows: scroll until no new rows appear
-                for cells in self._read_visible_rows(page):
+                for cells in self._read_visible_rows():
                     if len(cells) < 2:
                         continue
                     row = {}
@@ -471,26 +586,25 @@ class ReportScraper:
                 else:
                     stable = 0
                     last_count = len(collected)
-                page.mouse.wheel(0, 800)
-                page.keyboard.press("PageDown")
-                page.wait_for_timeout(400)
+                self._js("window.scrollBy(0, 800); for (const el of document.querySelectorAll('[role=grid],[role=table],table')) { el.scrollTop += 800; if (el.parentElement) el.parentElement.scrollTop += 800; }")
+                time.sleep(0.4)
             if total is not None and len(collected) >= total:
                 break
-            nxt = page.get_by_role("button", name=re.compile(r"next page|next", re.I))
-            if nxt.count() == 0 or not nxt.first.is_enabled():
+            nxt = self._visible(xp_ci("next page", "*[self::button or @role='button']")) or self._visible(xp_ci("next", "*[self::button or @role='button']"))
+            if nxt is None or not nxt.is_enabled() or nxt.get_attribute("aria-disabled") == "true":
                 break
-            nxt.first.click(timeout=10_000)
-            page.wait_for_timeout(2000)
+            self._click(nxt)
+            time.sleep(2)
         rows = list(collected.values())
         self.log(f"[scrape] grid: {len(rows)} row(s) across {pages_seen} page(s), headers={headers}")
         return rows
 
     # -- debugging ---------------------------------------------------------
-    def _dump(self, page: Page, name: str) -> None:
+    def _dump(self, name: str) -> None:
         safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
         try:
-            page.screenshot(path=str(self.debug_dir / f"{safe}.png"), full_page=True)
-            (self.debug_dir / f"{safe}.html").write_text(page.content(), encoding="utf-8")
-            self.log(f"[scrape] saved debug/{safe}.png and debug/{safe}.html (url host: {_host(page.url)})")
+            self.driver.save_screenshot(str(self.debug_dir / f"{safe}.png"))
+            (self.debug_dir / f"{safe}.html").write_text(self.driver.page_source, encoding="utf-8")
+            self.log(f"[scrape] saved debug/{safe}.png and debug/{safe}.html (url host: {_host(self.driver.current_url)})")
         except Exception as exc:  # noqa: BLE001
             self.log(f"[scrape] could not save debug output: {type(exc).__name__}")

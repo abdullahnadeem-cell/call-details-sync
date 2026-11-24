@@ -33,15 +33,61 @@ permissions:
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
+    # Set the repository variable RUNNER_LABEL (e.g. "self-hosted") to run on your own
+    # machine if Google blocks sign-ins from GitHub's datacenter IPs. No code change needed.
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     timeout-minutes: 15
     env:
+      GADS_EMAIL: ${{ secrets.GADS_EMAIL }}
+      GADS_PASSWORD: ${{ secrets.GADS_PASSWORD }}
+      GADS_TOTP_SECRET: ${{ secrets.GADS_TOTP_SECRET }}
       GADS_REPORT_URL: ${{ secrets.GADS_REPORT_URL }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       GADS_ACCOUNT_TZ: ${{ vars.GADS_ACCOUNT_TZ || 'Pacific/Honolulu' }}
+      GADS_PROFILE_DIR: ${{ vars.GADS_PROFILE_DIR || '.chrome-profile' }}
       PYTHONUNBUFFERED: "1"
     steps:
+      - name: Preflight (secrets present, repo visibility)
+        id: preflight
+        env:
+          IS_DRY: ${{ github.event.inputs.dry_run }}
+          REPO_PRIVATE_EVENT: ${{ github.event.repository.private }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +x
+          for v in GADS_EMAIL GADS_PASSWORD GADS_TOTP_SECRET; do
+            [ -n "${!v}" ] && echo "::add-mask::${!v}"
+          done
+          [ -n "$GADS_EMAIL" ] && echo "::add-mask::${GADS_EMAIL%%@*}"
+          MISSING=""
+          for v in GADS_EMAIL GADS_PASSWORD GADS_TOTP_SECRET GADS_REPORT_URL; do
+            [ -z "${!v}" ] && MISSING="$MISSING $v"
+          done
+          if [ "$IS_DRY" != "true" ]; then
+            for v in SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY; do
+              [ -z "${!v}" ] && MISSING="$MISSING $v"
+            done
+          fi
+          # repo visibility: from the event payload when present, else from the API
+          PRIV="$REPO_PRIVATE_EVENT"
+          if [ -z "$PRIV" ]; then
+            PRIV=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY" | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("private","")).lower())' 2>/dev/null || echo "")
+          fi
+          echo "private=$PRIV" >> "$GITHUB_OUTPUT"
+          echo "repository private: ${PRIV:-unknown}"
+          if [ "$PRIV" != "true" ]; then
+            echo "::warning::repository is not private: debug artifacts and the Chrome profile cache are disabled, phone numbers are masked in logs"
+          fi
+          if [ -n "$MISSING" ]; then
+            echo "::error::missing secrets:$MISSING (add them under Settings > Secrets and variables > Actions)"
+            mkdir -p debug && echo MISSING_SECRETS > debug/error_code.txt
+            echo "error_code=MISSING_SECRETS" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "all required secrets are set"
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -50,32 +96,21 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
+        run: pip install -r requirements.txt
 
-      - name: Restore browser session from GADS_STORAGE_STATE
-        env:
-          GADS_STORAGE_STATE: ${{ secrets.GADS_STORAGE_STATE }}
-        run: |
-          set +x
-          if [ -z "$GADS_STORAGE_STATE" ]; then
-            echo "::error::secret GADS_STORAGE_STATE is empty; run scripts/login_once.py and add it"
-            mkdir -p debug && echo SESSION_EXPIRED > debug/error_code.txt
-            exit 1
-          fi
-          printf '%s' "$GADS_STORAGE_STATE" | tr -d '\n\r ' | base64 -d > storage_state.json
-          python - <<'PY'
-          import json, sys
-          try:
-              d = json.load(open("storage_state.json"))
-              assert isinstance(d.get("cookies"), list)
-          except Exception as e:
-              print("::error::GADS_STORAGE_STATE is not a valid Playwright storage state (base64 of storage_state.json):", type(e).__name__)
-              import os; os.makedirs("debug", exist_ok=True); open("debug/error_code.txt", "w").write("SESSION_EXPIRED")
-              sys.exit(1)
-          print(f"storage state restored: {len(d['cookies'])} cookie(s)")
-          PY
+      - name: Chrome version
+        run: google-chrome --version || chromium --version || echo "no system Chrome found; Selenium Manager will try to fetch one"
+
+      # The Chrome profile holds Google cookies, so it is cached only when the repo is private.
+      # Restoring a profile from the previous run avoids a fresh login (and new-device checks) every day.
+      - name: Restore Chrome profile from cache
+        if: steps.preflight.outputs.private == 'true' && env.GADS_PROFILE_DIR == '.chrome-profile'
+        uses: actions/cache/restore@v4
+        with:
+          path: .chrome-profile
+          key: chrome-profile-v1-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            chrome-profile-v1-${{ runner.os }}-
 
       - name: Build arguments
         id: args
@@ -96,12 +131,30 @@ jobs:
       - name: Sync call details
         run: python -m src.run ${{ steps.args.outputs.args }}
 
-      - name: Remove session file
-        if: always()
-        run: rm -f storage_state.json
+      - name: Trim Chrome profile before caching
+        if: always() && steps.preflight.outputs.private == 'true' && env.GADS_PROFILE_DIR == '.chrome-profile'
+        run: |
+          [ -d .chrome-profile ] || exit 0
+          rm -rf .chrome-profile/Singleton* .chrome-profile/Crashpad .chrome-profile/BrowserMetrics* \
+                 .chrome-profile/GrShaderCache .chrome-profile/ShaderCache .chrome-profile/GraphiteDawnCache \
+                 .chrome-profile/Default/Cache .chrome-profile/Default/"Code Cache" .chrome-profile/Default/GPUCache \
+                 .chrome-profile/Default/"Service Worker" .chrome-profile/Default/DawnCache .chrome-profile/Default/DawnWebGPUCache \
+                 .chrome-profile/Default/"Session Storage" .chrome-profile/Default/optimization_guide* 2>/dev/null || true
+          du -sh .chrome-profile || true
 
-      - name: Upload debug output (screenshots contain phone numbers; repo must stay private)
-        if: failure()
+      - name: Save Chrome profile to cache
+        if: always() && steps.preflight.outputs.private == 'true' && env.GADS_PROFILE_DIR == '.chrome-profile'
+        uses: actions/cache/save@v4
+        with:
+          path: .chrome-profile
+          key: chrome-profile-v1-${{ runner.os }}-${{ github.run_id }}
+
+      - name: Remove downloads and profile from the runner
+        if: always()
+        run: rm -rf downloads .chrome-profile out
+
+      - name: Upload debug output (private repos only; screenshots can contain phone numbers)
+        if: failure() && steps.preflight.outputs.private == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: debug-${{ github.run_id }}
@@ -115,9 +168,10 @@ jobs:
           ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          [ -z "$ALERT_WEBHOOK_URL" ] && { echo "ALERT_WEBHOOK_URL not set; relying on GitHub failure email"; exit 0; }
           CODE=$(tr -cd 'A-Z_' < debug/error_code.txt 2>/dev/null || true)
           CODE=${CODE:-UNKNOWN}
+          echo "failure code: $CODE"
+          [ -z "$ALERT_WEBHOOK_URL" ] && { echo "ALERT_WEBHOOK_URL not set; relying on GitHub failure email"; exit 0; }
           MSG="call-details-sync failed: $CODE ($RUN_URL)"
           curl -sS -m 20 -X POST -H 'Content-Type: application/json' \
             --data "{\"text\":\"$MSG\",\"content\":\"$MSG\",\"error_code\":\"$CODE\",\"run_url\":\"$RUN_URL\"}" \

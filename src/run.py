@@ -21,6 +21,7 @@ from . import parse
 from .config import Config
 from .dates import HST, days_in, default_range, split_range
 from .errors import CONFIG_ERROR, DATE_RANGE_MISMATCH, SyncError
+from .masking import mask_phone
 from .reconcile import format_table, print_reconciliation
 
 
@@ -89,7 +90,8 @@ def decode_download(data: bytes) -> str:
 
 def collect_rows(cfg: Config, start: date, end: date, headed: bool) -> tuple[list[dict], list[str]]:
     """Drive the browser for every chunk of the range. Returns (raw rows, method notes)."""
-    from .scrape import ReportScraper  # imported lazily so --from-file works without Playwright
+    from .google_login import Credentials
+    from .scrape import ReportScraper  # imported lazily so --from-file works without a browser
 
     cfg.require_scrape()
     chunks = split_range(start, end)
@@ -98,13 +100,15 @@ def collect_rows(cfg: Config, start: date, end: date, headed: bool) -> tuple[lis
     notes: list[str] = []
     with ReportScraper(
         report_url=cfg.report_url,
-        storage_state_path=cfg.storage_state_path,
         account_tz=cfg.account_tz,
         headless=not headed,
         debug_dir=cfg.debug_dir,
         downloads_dir=cfg.downloads_dir,
         log=log,
+        profile_dir=cfg.profile_dir,
+        credentials=Credentials(cfg.gads_email, cfg.gads_password, cfg.gads_totp_secret),
     ) as scraper:
+        log(f"[run] google session: {scraper.login_method}")
         for cs, ce in chunks:
             result = scraper.fetch(cs, ce)
             label = cs.isoformat() if cs == ce else f"{cs}..{ce}"
@@ -125,12 +129,15 @@ def assert_rows_in_range(rows: list[dict], start: date, end: date, tz: str) -> N
         raise SyncError(DATE_RANGE_MISMATCH, f"{len(outside)} row(s) start outside {start}..{end} (e.g. {sample}); the page did not honour the requested range")
 
 
-def print_rows(rows: list[dict]) -> None:
+def print_rows(rows: list[dict], limit: int = 50) -> None:
+    """Dry-run listing. Phone numbers are masked to the last 4 digits: logs may be public."""
     body = [
-        [r["start_time"], r["duration_seconds"], r["caller_phone_raw"], r["call_type"], r["campaign"], r["call_key"][:10]]
-        for r in rows
+        [r["start_time"], r["duration_seconds"], mask_phone(r["caller_phone_raw"]), r["call_type"], r["campaign"], r["call_key"][:10]]
+        for r in rows[:limit]
     ]
-    log(format_table(["start_time", "dur_s", "caller_phone_raw", "call_type", "campaign", "call_key"], body))
+    log(format_table(["start_time", "dur_s", "caller(masked)", "call_type", "campaign", "call_key"], body))
+    if len(rows) > limit:
+        log(f"... {len(rows) - limit} more row(s) in the JSON file")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -189,7 +196,7 @@ def main(argv: list[str] | None = None) -> int:
     except SyncError as exc:
         error_code_file.write_text(exc.code)
         log(f"ERROR {exc}")
-        return 2 if exc.code == CONFIG_ERROR else 1
+        return 2 if exc.code in (CONFIG_ERROR, "MISSING_SECRETS") else 1
     except Exception as exc:  # noqa: BLE001
         error_code_file.write_text("UNEXPECTED")
         log(f"ERROR UNEXPECTED: {type(exc).__name__}: {exc}")

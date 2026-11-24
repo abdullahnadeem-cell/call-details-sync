@@ -5,23 +5,27 @@ every call (including the caller's phone number, which the Google Ads API never
 exposes) into the Supabase table `public.google_ads_call_details`. The TCA Wireless
 dashboard uses that table to tie call leads to sales.
 
-- Runs on GitHub Actions (06:30 HST and 18:30 HST), or by hand for any day or range.
-- Python 3.12 + Playwright (Chromium). No frontend, no n8n, no schema changes.
+- Runs entirely on GitHub Actions (06:30 HST and 18:30 HST), or by hand for any day or range.
+- Python 3.12 + Selenium (Chrome). No frontend, no n8n, no schema changes, nothing on anyone's computer.
+- Signs in to Google by itself as a dedicated Workspace account (password + authenticator code
+  from GitHub secrets). Plain Selenium, no stealth tricks: if Google challenges the login the run
+  fails with a clear code.
 - Idempotent: re-running a day never creates duplicates (`call_key` upsert).
-- Authentication is a saved browser session captured once by a human. **No password,
-  2FA code or app password is ever scripted.**
 
 ```
 call-details-sync/
   src/run.py             CLI entry point
   src/report_url.py      rewrites the date range inside the saved report link
-  src/scrape.py          drives Chromium, returns raw rows
+  src/google_login.py    self sign-in (email, password, authenticator), screen detection
+  src/scrape.py          drives Chrome, returns raw rows
   src/parse.py           normalizes rows (times, durations, call_key)
   src/supabase_sink.py   REST upsert + reconciliation reads
   src/reconcile.py       informational per-day table
-  scripts/login_once.py  one time headed login that saves storage_state.json
-  tests/                 unit tests + a local fake report page for the scraper
-  .github/workflows/call-details-sync.yml
+  src/masking.py         masks phone numbers / emails in logs
+  scripts/rows_to_sql.py turns dry-run JSON into upsert SQL (manual loads)
+  tests/                 unit tests + local fake report and fake sign-in pages for the browser tests
+  .github/workflows/call-details-sync.yml   the daily job
+  .github/workflows/tests.yml               pytest on every push
 ```
 
 ---
@@ -31,118 +35,99 @@ call-details-sync/
 1. **Date range.** With no arguments the run covers the last 2 full days in Hawaii
    time (yesterday and the day before), because Google delivers call data late and
    the upsert is idempotent. `--date`, `--from/--to` and `--lookback N` override this.
-2. **Report URL.** The saved report link stores its custom date range inside the
+2. **Sign in.** Chrome opens `accounts.google.com`. If the reused profile is still
+   signed in, nothing else happens. Otherwise the job types the email and password,
+   answers the 2-Step Verification prompt with a code from the authenticator secret,
+   dismisses "stay signed in" style screens and picks the right account in the chooser.
+   Anything else (phone prompt, SMS, passkey, captcha, "Verify it's you") fails the run
+   with `LOGIN_CHALLENGE`.
+3. **Report URL.** The saved report link stores its custom date range inside the
    `reportState` parameter (base64 protobuf) as two plain `YYYY-MM-DD` strings. The
-   job decodes it, swaps the two dates (same length, so every length prefix stays
-   valid), re-encodes with the same base64 flavour and loads that URL. If the page
-   does not show the requested range, it falls back to the UI date picker and logs
-   which method was used. A range longer than 7 days is loaded one day at a time.
-3. **Session check.** If the browser lands on `accounts.google.com`, a sign-in or a
-   "Verify it's you" page, the run stops with `SESSION_EXPIRED`.
-4. **Verify.** The date range shown on the page (outside the data grid) must match
-   the request, and every parsed row must start inside the range.
-5. **Read rows.** Preferred: the report's own **Download → .csv** (complete result).
-   Fallback: scrape the grid (rows per page maximised, virtual scroll, pagination).
-   The row count must equal the total the page reports ("1 – 25 of 25") or the run
-   fails with `ROWCOUNT_MISMATCH`. Zero calls is valid (nothing written, exit 0).
-6. **Write.** Rows are normalised (see §4), de-duplicated by `call_key`, and POSTed to
-   Supabase REST in batches of 200 with `on_conflict=call_key` and
+   job swaps the two dates (same length, so every length prefix stays valid) and loads
+   that URL. If the page does not show the requested range, it falls back to the UI date
+   picker and logs which method was used. A range longer than 7 days is loaded one day at a time.
+4. **Verify.** The page must show the requested range (checked with the data grid text
+   removed) and every parsed row must start inside the range.
+5. **Read rows.** Preferred: the report's own **Download → .csv** (headless downloads are
+   allowed through Chrome DevTools). Fallback: scrape the grid (rows per page maximised,
+   scroll, paginate). The row count must equal the total the page reports ("1 – 25 of 25")
+   or the run fails with `ROWCOUNT_MISMATCH`. Zero calls is valid (nothing written, exit 0).
+6. **Write.** Rows are normalised (§4), de-duplicated by `call_key`, and POSTed to the
+   Supabase REST API in batches of 200 with `on_conflict=call_key` and
    `Prefer: resolution=merge-duplicates`. The service role key is required (RLS is on
-   with no policies, so the anon key is rejected on purpose).
+   with no policies).
 7. **Reconcile (informational).** For each day: calls per campaign in the report vs
-   `phone_calls` in `gads_campaign_metrics` for that campaign and date, plus the rows
-   whose caller is shown as `--`. Mismatches are expected (Google only counts calls
-   above a minimum duration as conversions); this never fails the run.
+   `phone_calls` in `gads_campaign_metrics`, plus how many rows have a masked caller (`--`).
+   Mismatches are expected (Google only counts calls above a minimum duration as
+   conversions); this never fails the run.
 
-## 2. One time setup (Roch)
+Phone numbers are **masked to the last 4 digits in every log line**. Full numbers go only
+to Supabase (and to the `downloads/`, `out/` and `debug/` folders, which the workflow deletes
+or uploads only when the repository is private).
 
-### 2.1 Which Google account
+## 2. Setup
 
-Use a **dedicated Google user** that has **read-only** access to the TCA Google Ads
-account, with **2-Step Verification on**. Do not use a personal login. The saved
-session is as sensitive as that user's password.
+### 2.1 The Google account
 
-### 2.2 Install locally (once, on your own computer)
+Use a **dedicated Google Workspace user** (currently `abdullahnadeem@agentumai.tech`) that
+has access to the TCA Google Ads account. Recommended: read-only (standard) access in
+Google Ads, 2-Step Verification on with an **authenticator app** as the method, and no
+phone-prompt / passkey as the default second step (the script can only answer
+authenticator codes). Keep the recovery options current so Google is less likely to
+challenge sign-ins.
 
-```bash
-git clone <this repo> && cd call-details-sync
-python3.12 -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-python -m playwright install chromium
-```
+To get the authenticator secret: Google Account → Security → 2-Step Verification →
+Authenticator → "Set up" (or "Change") → **"Can't scan it?"** shows the base32 secret
+(letters and digits, spaces are fine). Also scan the QR code into a phone app so a human
+keeps a working second factor.
 
-### 2.3 Capture the browser session, screen by screen
+### 2.2 GitHub secrets and variables
 
-```bash
-export GADS_REPORT_URL='<the saved Call details report link>'   # Windows PowerShell: $env:GADS_REPORT_URL='...'
-python scripts/login_once.py
-```
-
-1. A Chromium window opens on the saved report link. Google shows **"Sign in"**.
-   Enter the dedicated user's email → Next.
-2. **Password** → Next.
-3. **2-Step Verification**: approve the prompt on the phone / enter the code.
-4. If Google asks **"Stay signed in?"** or **"Trust this browser?"** → choose **Yes**.
-   If it offers "Don't ask again on this device", tick it.
-5. Google Ads opens the **Call details** report. If an account chooser appears, pick
-   the TCA account. Wait until the table (or "No data") is visible.
-6. The terminal prints `Saved storage_state.json`. The window closes by itself.
-
-`storage_state.json` is git-ignored. Never commit it, email it or paste it anywhere
-except the GitHub secret below.
-
-### 2.4 Add the GitHub secrets and variable
-
-Repo → **Settings → Secrets and variables → Actions**.
+Repo → **Settings → Secrets and variables → Actions**. Never paste these anywhere else.
 
 | Name | Type | Value |
 | --- | --- | --- |
-| `GADS_STORAGE_STATE` | secret | base64 of `storage_state.json`, one line (see below) |
-| `GADS_REPORT_URL` | secret | the full saved report link |
+| `GADS_EMAIL` | secret | the dedicated account's email |
+| `GADS_PASSWORD` | secret | its password |
+| `GADS_TOTP_SECRET` | secret | the authenticator base32 secret (see §2.1) |
+| `GADS_REPORT_URL` | secret | the full saved "Call details" report link |
 | `SUPABASE_URL` | secret | `https://hdwkfqjgnuahqmmaseor.supabase.co` |
 | `SUPABASE_SERVICE_ROLE_KEY` | secret | Supabase → Project Settings → API → `service_role` |
 | `ALERT_WEBHOOK_URL` | secret, optional | any webhook that accepts a JSON POST (`{"text": "..."}`) |
 | `GADS_ACCOUNT_TZ` | **variable**, optional | Google Ads account time zone, default `Pacific/Honolulu` |
+| `RUNNER_LABEL` | **variable**, optional | runner label, default `ubuntu-latest` (see §6) |
+| `GADS_PROFILE_DIR` | **variable**, optional | persistent Chrome profile folder on a self-hosted runner |
 
-Base64 of the session file, copied to the clipboard:
+The workflow's first step checks these and fails with `MISSING_SECRETS`, printing only the
+**names** that are empty.
 
-```bash
-# macOS
-base64 -i storage_state.json | pbcopy
-```
+**The repository must be private before real data runs.** Logs are masked, but failure
+screenshots, downloads and the cached Chrome profile (cookies) are only kept when the
+repository is private; the workflow checks this itself and skips them otherwise.
+Settings → General → Danger Zone → Change visibility.
 
-```bash
-# Linux
-base64 -w0 storage_state.json | xclip -selection clipboard
-```
+### 2.3 Enabling the schedule
 
-```powershell
-# Windows PowerShell
-[Convert]::ToBase64String([IO.File]::ReadAllBytes('storage_state.json')) | Set-Clipboard
-```
-
-Or with the GitHub CLI:
+The workflow is kept disabled until the secrets exist. Turn it on with:
 
 ```bash
-gh secret set GADS_STORAGE_STATE --body "$(base64 -w0 storage_state.json)"
+gh workflow enable call-details-sync.yml
 ```
-
-The repository **must stay private**: failure screenshots and dry-run logs contain phone numbers.
-Check Settings → General → Danger Zone → Change visibility.
 
 ## 3. Running
 
 ### GitHub Actions
 
 Actions → **call-details-sync** → **Run workflow**. Inputs: `date` (one day), `from`/`to`
-(range), `dry_run` (print only). Leave all empty for the default window.
-Scheduled runs happen at 16:30 UTC (06:30 HST) and 04:30 UTC (18:30 HST).
-Two runs never overlap (concurrency group) and each is limited to 15 minutes.
+(range), `dry_run` (print only, no Supabase write). Leave all empty for the default window.
+Scheduled runs happen at 16:30 UTC (06:30 HST) and 04:30 UTC (18:30 HST). Two runs never
+overlap (concurrency group) and each is limited to 15 minutes.
 
-### Locally
+### Locally (needs Chrome; Selenium Manager fetches a matching driver)
 
 ```bash
-export GADS_REPORT_URL='...' SUPABASE_URL='...' SUPABASE_SERVICE_ROLE_KEY='...'
+export GADS_EMAIL='...' GADS_PASSWORD='...' GADS_TOTP_SECRET='...' GADS_REPORT_URL='...'
+export SUPABASE_URL='...' SUPABASE_SERVICE_ROLE_KEY='...'
 python -m src.run --date 2026-11-20 --dry-run        # browser + parse, no DB write, JSON in out/
 ```
 
@@ -155,21 +140,18 @@ python -m src.run --from 2026-11-01 --to 2026-11-23  # backfill (one page load p
 ```
 
 ```bash
-python -m src.run --lookback 5                       # the last 5 full HST days
-```
-
-```bash
 python -m src.run --dry-run --from-file tests/fixtures/call_details_sample.csv   # no browser at all
 ```
 
-Other flags: `--headed` shows the browser, `--out path.json` sets the dry-run output,
-`--no-reconcile` skips the reconciliation table. `--from-file` accepts a CSV download
-from the report or a JSON list of raw rows (a previous dry-run file also works).
+Other flags: `--headed` shows the browser, `--lookback N`, `--out path.json`, `--no-reconcile`.
+`--from-file` accepts a CSV download from the report or a JSON list of raw rows (a previous
+dry-run file also works). Optional env: `GADS_PROFILE_DIR` (Chrome profile folder, default
+`.chrome-profile`), `CHROME_BINARY`, `CHROMEDRIVER_PATH` (override Selenium Manager).
 
 ### Backfill
 
 ```bash
-python -m src.run --from 2026-11-01 --to $(date -u -d 'yesterday' +%F)
+python -m src.run --from 2026-11-01 --to $(TZ=Pacific/Honolulu date -d 'yesterday' +%F)
 ```
 
 or run the workflow with `from=2026-11-01`, `to=<yesterday>`. Re-running any part of
@@ -177,20 +159,12 @@ the range is safe.
 
 ### Loading rows through SQL instead of the REST key
 
-If the rows were read some other way (for example from a CSV downloaded by hand) and you
-want to load them without the service role key, parse them with `--dry-run`, then turn the
-JSON into upsert SQL and run it in the Supabase SQL editor or through the Supabase connector.
-It is the same upsert on `call_key`, so re-running never duplicates.
+Parse with `--dry-run`, turn the JSON into upsert SQL and run it in the Supabase SQL editor.
+Same upsert on `call_key`, so re-running never duplicates.
 
 ```bash
-python -m src.run --from-file "Call details.csv" --date 2026-11-20 --dry-run --out out/rows.json
+python scripts/rows_to_sql.py out/rows_2026-11-20_2026-11-20.json > out/load.sql
 ```
-
-```bash
-python scripts/rows_to_sql.py out/rows.json > out/load.sql
-```
-
-`status` is never written, so a status set elsewhere is not overwritten by a re-run.
 
 ### Verify in Supabase (SQL editor)
 
@@ -203,12 +177,6 @@ select count(*) filter (where caller_phone_e164 is null) as no_phone,
        count(*) filter (where campaign_id is null)       as no_campaign_id,
        count(*)
 from google_ads_call_details;
-```
-
-```sql
--- recent calls with their campaign match
-select start_time, duration_seconds, caller_phone_raw, caller_phone_e164, campaign, campaign_id
-from google_ads_call_details order by start_time desc limit 50;
 ```
 
 ## 4. Column mapping
@@ -227,51 +195,68 @@ from google_ads_call_details order by start_time desc limit 50;
 | Campaign | `campaign` | exactly as shown |
 | whole row | `raw` | jsonb `{original header: cell}` |
 | computed | `call_key` | `sha1("{start_time ISO UTC}|{caller_phone_raw}|{duration_seconds}|{campaign}")`, e.g. `2026-11-21T00:35:10+00:00|+1 808-688-3603|35|TCA - Search - Brand`; a missing value is an empty string |
-| computed | `status` | null (this report has no status column) |
 
-Not sent, filled by the database trigger: `caller_phone_e164`, `campaign_id`,
-`call_date_hst`. Left empty on purpose: `caller_phone_number`, `call_source`, `ad_group`.
-Cells showing `--` become null for every column except `caller_phone_raw`.
+Not sent: `status` (so a value set elsewhere survives re-runs), and the trigger-owned
+`caller_phone_e164`, `campaign_id`, `call_date_hst`. Left empty on purpose:
+`caller_phone_number`, `call_source`, `ad_group`. Cells showing `--` become null for every
+column except `caller_phone_raw`. Headers are matched by name (internal names such as
+`CallStartTime` and UI labels such as "Start time"), with a positional fallback in the
+report's column order; the log warns when the fallback is used.
 
-Headers are matched by name (internal names such as `CallStartTime` and UI labels such
-as "Start time"), with a positional fallback in the report's column order when a header
-is unknown; the log shows a warning when the fallback is used.
+## 5. Session reuse
 
-## 5. Session refresh (expected every few weeks)
+Google challenges fresh logins from new machines far more often than returning browsers.
+The job therefore keeps a Chrome profile (`.chrome-profile/`, cookies included) and carries
+it from run to run with `actions/cache` (restore at start, trimmed and saved at the end under
+`chrome-profile-v1-<os>-<run id>`, restored by prefix so the newest wins). On the next run the
+account is usually still signed in and no password or code is typed at all. If the restored
+profile is rejected, the job simply signs in again with the secrets.
 
-Google sessions captured this way usually last **several weeks**, not forever. They end
-sooner if the user signs out everywhere, changes the password, or Google flags the
-GitHub runner's IP. When a run fails with `SESSION_EXPIRED`:
+Because the profile contains cookies, caching is **only enabled when the repository is
+private**. On a self-hosted runner set the variable `GADS_PROFILE_DIR` to a persistent folder
+and the cache steps are skipped.
 
-1. On your computer, run `python scripts/login_once.py` again (§2.3).
-2. Update the `GADS_STORAGE_STATE` secret with the new base64 (§2.4).
-3. Re-run the failed workflow (Actions → the failed run → **Re-run jobs**), or run it by
-   hand with `from`/`to` covering the days that were missed.
+## 6. If Google blocks sign-ins from GitHub's IPs
 
-Nothing else needs to change. Put a monthly reminder in the calendar to refresh
-proactively.
+Scripted Google logins from datacenter addresses are sometimes refused outright
+("This browser or app may not be secure", "Couldn't sign you in", endless "Verify it's you").
+The job reports these as `LOGIN_CHALLENGE` and takes a screenshot of the Google page
+(uploaded only when the repo is private). **Do not keep re-running**: repeated failed attempts
+can lock the account. After two honest attempts:
 
-## 6. Troubleshooting by error code
+1. Sign in once by hand in a normal browser with that account, approve any "new sign-in"
+   notice and check Security → Recent security activity.
+2. Run the job from a normal home or office connection: install the GitHub Actions
+   runner on a machine there (`Settings → Actions → Runners → New self-hosted runner`,
+   Chrome installed), then set the repository variable `RUNNER_LABEL=self-hosted` and
+   `GADS_PROFILE_DIR` to a folder on that machine (for example `/home/runner/gads-profile`).
+   No code change is needed; the schedule, inputs and secrets stay the same.
 
-The last log line reads `ERROR <CODE>: <detail>`; the workflow uploads `debug/`
-(screenshot + page HTML, 3 day retention) and posts `<CODE>` to `ALERT_WEBHOOK_URL`.
+## 7. Troubleshooting by error code
+
+The last log line reads `ERROR <CODE>: <detail>`; the workflow posts `<CODE>` to
+`ALERT_WEBHOOK_URL` when set and uploads `debug/` (3 day retention, private repos only).
 
 | Code | Meaning | What to do |
 | --- | --- | --- |
-| `SESSION_EXPIRED` | Landed on a Google sign-in / "Verify it's you" page, or the secret is empty or not valid base64 of `storage_state.json`. | Refresh the session (§5). Check the screenshot in the debug artifact. |
-| `TABLE_NOT_RENDERED` | The report page loaded but neither the grid nor a "no data" message appeared within the timeout. | Open the saved link in a browser: is the report still there, same account? Google Ads UI change → check the HTML in `debug/`. Transient → re-run. |
+| `MISSING_SECRETS` | One or more required secrets are empty (names are printed). | Add them under Settings → Secrets and variables → Actions. |
+| `LOGIN_BAD_CREDENTIALS` | Google rejected the email or password. | Check `GADS_EMAIL` / `GADS_PASSWORD`; sign in by hand once to confirm the password. |
+| `LOGIN_TOTP_MISSING` | Google asked for an authenticator code but `GADS_TOTP_SECRET` is empty. | Add the base32 secret (§2.1). |
+| `LOGIN_TOTP_REJECTED` | The code was refused. | Wrong secret, or the account's authenticator was re-enrolled: generate a new secret and update it. Runner clocks are accurate, so skew is unlikely. |
+| `LOGIN_CHALLENGE` | Google asked for something a script cannot do (phone tap, SMS, passkey, captcha, "Verify it's you", "browser not secure"), or showed an unknown screen. | See the screenshot `debug/login-*.png`. Follow §6. Make the authenticator the default second step and remove phone prompts if possible. |
+| `ADS_NO_ACCESS` | Signed in, but Google Ads shows an account chooser or "no access" for the report. | Give the dedicated user access to the Ads account in the saved link (customer id in `ocid=`). |
+| `SESSION_EXPIRED` | Landed on a sign-in page even after the self-login retry. | Usually a `LOGIN_*` cause further up the log; otherwise re-run. |
+| `TABLE_NOT_RENDERED` | The report page loaded but neither the grid nor a "no data" message appeared within 90 s. | Open the saved link in a browser: is the report still there, same account? Google Ads UI change → check the HTML in `debug/`. Transient → re-run. |
 | `DATE_RANGE_MISMATCH` | The page did not show the requested range after the URL rewrite and the date picker fallback, or rows start outside it. | Check the report link still has a *custom* date range. If the date picker layout changed, see `_set_range_via_ui` in `src/scrape.py`. |
-| `ROWCOUNT_MISMATCH` | Rows captured ≠ the total the page shows. | Re-run once (slow render). If it repeats, check the CSV download in a browser; maybe the download includes extra summary rows (`parse.rows_from_csv_text`). |
-| `SUPABASE_ERROR` | Non-2xx from Supabase REST; status and body are in the log. 401/403 = wrong key (must be `service_role`); 400 = column problem. | Check `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY`. Nothing was partially committed per batch, re-running is safe. |
+| `ROWCOUNT_MISMATCH` | Rows captured ≠ the total the page shows. | Re-run once (slow render). If it repeats, check the CSV download in a browser; maybe it includes extra summary rows (`parse.rows_from_csv_text`). |
+| `SUPABASE_ERROR` | Non-2xx from Supabase REST; status and body are in the log. 401/403 = wrong key (must be `service_role`); 400 = column problem. | Check `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY`. Re-running is safe. |
 | `PARSE_ERROR` | A cell could not be parsed (unexpected time or duration format, missing columns). | The detail names the cell. Add the format to `src/parse.py` (`TIME_FORMATS`, `parse_duration`). |
 | `PAGE_LOAD_FAILED` | Navigation failed twice. | Network / Google outage; re-run. |
-| `CONFIG_ERROR` | Missing secret, bad CLI dates, missing `storage_state.json`. | See the message. |
+| `CONFIG_ERROR` | Bad CLI dates or missing Supabase settings for a real run. | See the message. |
 
 Notes:
 
-- Dry runs print the rows to the log; real runs print counts only. Keep the Actions log
-  private too.
-- The job never calls GoHighLevel or any tagging webhook. Contact linking is done in the
-  database.
-- Tests: `python -m pytest -q`. The scraper tests run the real browser against
-  `tests/fixtures/fake_report/index.html` and are skipped when Chromium is not installed.
+- The job never calls GoHighLevel or any tagging webhook. Contact linking is done in the database.
+- Tests: `python -m pytest -q`. The browser tests drive real Chrome against
+  `tests/fixtures/fake_report/` and `tests/fixtures/fake_login/` and are skipped when Chrome
+  or a matching driver is not available (set `CHROME_BINARY` / `CHROMEDRIVER_PATH` locally).

@@ -1,0 +1,27 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Sign in - Google Accounts</title><script src="common.js"></script></head>
+<body>
+<div id="chooser" style="display:none">
+  <h1>Choose an account</h1>
+  <ul>
+    <li role="link" id="acct">test@agentumai.tech</li>
+    <li role="link" id="other">Use another account</li>
+  </ul>
+</div>
+<div id="emailpage">
+  <h1>Sign in</h1>
+  <p>Use your Google Account</p>
+  <input type="email" id="identifierId" aria-label="Email or phone" placeholder="Email or phone">
+  <div id="err" style="display:none;color:red"></div>
+  <button id="next">Next</button>
+</div>
+<script>
+if (MODE === "chooser") { document.getElementById("chooser").style.display = "block"; document.getElementById("emailpage").style.display = "none"; }
+document.getElementById("acct").onclick = () => { sessionStorage.setItem("email", "test@agentumai.tech"); go("password.html"); };
+document.getElementById("other").onclick = () => { document.getElementById("chooser").style.display = "none"; document.getElementById("emailpage").style.display = "block"; };
+document.getElementById("next").onclick = () => {
+  const v = document.getElementById("identifierId").value.trim();
+  if (!v.includes("@")) return showError("err", "Enter a valid email or phone number");
+  if (MODE === "noaccount") return showError("err", "Couldn’t find your Google Account");
+  sessionStorage.setItem("email", v); go("password.html");
+};
+</script></body></html>

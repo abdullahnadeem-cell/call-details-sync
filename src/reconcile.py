@@ -48,6 +48,6 @@ def print_reconciliation(rows: list[dict], days: list[str], sink, log: Callable[
             if stored is not None:
                 log(f"[reconcile] {day}: rows now stored in google_ads_call_details = {stored}")
     masked = [r for r in rows if (r.get("caller_phone_raw") or "").strip() in {"--", ""}]
-    log(f"\n[reconcile] rows with caller_phone_raw '--' or empty: {len(masked)}")
+    log(f"\n[reconcile] rows with caller_phone_raw '--' or empty: {len(masked)} (these have no number to link)")
     for r in masked:
         log(f"  {r['start_time']}  dur={r.get('duration_seconds')}  campaign={r.get('campaign')}  type={r.get('call_type')}")
