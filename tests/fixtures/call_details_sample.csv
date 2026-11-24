@@ -1,0 +1,9 @@
+Call details
+"Nov 20, 2026"
+Start time,Duration,Caller country code,Caller area code,Caller ID,Call recording,Call type,Display location,Ad telephony property group,Campaign
+"Nov 20, 2026, 8:05:12 AM",0:35,1,808,+1 808-688-3603,--,Mobile click-to-call,Ad,Call extension,TCA - Search - Brand
+"Nov 20, 2026, 9:41:00 AM",3:02,1,808,+1 808-555-0142,https://ads.google.com/recordings/abc123,Manually dialed,Ad,Call extension,TCA - Search - iPhone Repair
+"Nov 20, 2026, 1:15:45 PM",0:08,1,808,--,--,Mobile click-to-call,Ad,Call extension,TCA - Search - Brand
+"Nov 20, 2026, 1:15:45 PM",0:08,1,808,--,--,Mobile click-to-call,Ad,Call extension,TCA - Search - Brand
+"Nov 20, 2026, 4:30:00 PM",1:02:03,1,415,+1 415-555-0199,--,Manually dialed,Website,Location extension,TCA - Pmax - Store
+Total: Call details,,,,,,,,,

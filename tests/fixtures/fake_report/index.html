@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Call details - Google Ads</title>
+<style>
+  body { font-family: sans-serif; margin: 24px; }
+  [role=grid] { border-collapse: collapse; }
+  [role=gridcell], [role=columnheader] { border: 1px solid #ccc; padding: 4px 8px; }
+  #menu { display: none; border: 1px solid #999; width: 160px; }
+  #menu[data-open="1"] { display: block; }
+  #menu [role=menuitem] { padding: 4px; cursor: pointer; }
+</style>
+</head>
+<body>
+<!--
+  A stand-in for the Google Ads Report Editor page, used only by tests.
+  It decodes the dates out of the reportState parameter exactly like the real
+  page would honour them, shows a paginator "1 - N of N", and offers
+  Download > .csv (a blob download). Modes via ?mode=:
+    signin   - a "Verify it's you" page without any grid
+    nodata   - the report renders its "No data to display" message
+    nocsv    - no Download button, so the grid must be scraped
+    mismatch - the CSV has one row fewer than the paginator claims
+    hang     - nothing ever renders
+    ignore   - the page ignores reportState dates until the date picker is used
+-->
+<header>
+  <button id="picker" role="button" aria-label="Date range">loading</button>
+  <button id="download" role="button" aria-label="Download">⬇</button>
+  <div id="menu" role="menu">
+    <div role="menuitem" data-fmt="csv">.csv</div>
+    <div role="menuitem" data-fmt="excel">Excel .csv</div>
+    <div role="menuitem" data-fmt="tsv">.tsv</div>
+    <div role="menuitem" data-fmt="xlsx">.xlsx</div>
+  </div>
+</header>
+<div id="pickerdialog" style="display:none">
+  <div role="menuitem" id="custom">Custom</div>
+  <label>Start date <input role="textbox" aria-label="Start date" id="start"></label>
+  <label>End date <input role="textbox" aria-label="End date" id="end"></label>
+  <button role="button" id="apply">Apply</button>
+</div>
+<main id="main"><p id="status">Loading report…</p></main>
+<footer id="pager"></footer>
+<script>
+const MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const q = new URLSearchParams(location.search);
+const mode = q.get("mode") || "normal";
+const stateDates = (() => {
+  const s = q.get("reportState") || "";
+  try {
+    const bin = atob(s.replace(/-/g, "+").replace(/_/g, "/"));
+    const m = bin.match(/(\d{4}-\d{2}-\d{2})\x12\x0a(\d{4}-\d{2}-\d{2})/);
+    return m ? [m[1], m[2]] : null;
+  } catch (e) { return null; }
+})();
+let range = stateDates || ["2026-11-01", "2026-11-24"];
+if (mode === "ignore" && !sessionStorage.getItem("picked")) range = ["2026-11-01", "2026-11-24"];
+function fmt([a, b]) {
+  const [y1, m1, d1] = a.split("-").map(Number), [y2, m2, d2] = b.split("-").map(Number);
+  if (a === b) return `${MON[m1-1]} ${d1}, ${y1}`;
+  if (y1 === y2 && m1 === m2) return `${MON[m1-1]} ${d1} – ${d2}, ${y1}`;
+  return `${MON[m1-1]} ${d1}, ${y1} – ${MON[m2-1]} ${d2}, ${y2}`;
+}
+const HEADERS = ["Start time","Duration","Caller country code","Caller area code","Caller ID","Call recording","Call type","Display location","Ad telephony property group","Campaign"];
+const DATA = [
+  ["Nov 20, 2026, 8:05:12 AM","0:35","1","808","+1 808-688-3603","--","Mobile click-to-call","Ad","Call extension","TCA - Search - Brand"],
+  ["Nov 20, 2026, 9:41:00 AM","3:02","1","808","+1 808-555-0142","https://ads.google.com/recordings/abc123","Manually dialed","Ad","Call extension","TCA - Search - iPhone Repair"],
+  ["Nov 20, 2026, 1:15:45 PM","0:08","1","808","--","--","Mobile click-to-call","Ad","Call extension","TCA - Search - Brand"],
+  ["Nov 20, 2026, 4:30:00 PM","1:02:03","1","415","+1 415-555-0199","--","Manually dialed","Website","Location extension","TCA - Pmax - Store"],
+];
+function csvText(rows) {
+  const esc = v => /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
+  return ["Call details", esc(fmt(range)), HEADERS.join(","), ...rows.map(r => r.map(esc).join(",")), "Total: Call details" + ",".repeat(9)].join("\n") + "\n";
+}
+function render() {
+  document.getElementById("picker").textContent = fmt(range);
+  const main = document.getElementById("main");
+  if (mode === "hang") return;
+  if (mode === "signin") {
+    document.title = "Sign in - Google Accounts";
+    document.getElementById("download").remove();
+    main.innerHTML = "<h1>Verify it's you</h1><p>To help keep your account safe, Google wants to make sure it's really you trying to sign in.</p>";
+    return;
+  }
+  if (mode === "nodata") {
+    main.innerHTML = "<p>No data to display</p>";
+    document.getElementById("pager").textContent = "";
+    return;
+  }
+  if (mode === "nocsv") document.getElementById("download").remove();
+  const grid = document.createElement("div");
+  grid.setAttribute("role", "grid");
+  const head = document.createElement("div"); head.setAttribute("role", "row");
+  HEADERS.forEach(h => { const c = document.createElement("div"); c.setAttribute("role", "columnheader"); c.textContent = h; head.appendChild(c); });
+  grid.appendChild(head);
+  DATA.forEach(r => {
+    const row = document.createElement("div"); row.setAttribute("role", "row");
+    r.forEach((v, i) => {
+      const c = document.createElement("div"); c.setAttribute("role", "gridcell");
+      if (i === 5 && v.startsWith("http")) { const a = document.createElement("a"); a.href = v; a.textContent = "Play"; c.appendChild(a); }
+      else if (i === 9) { const a = document.createElement("a"); a.href = "#campaign"; a.textContent = v; c.appendChild(a); }
+      else c.textContent = v;
+      row.appendChild(c);
+    });
+    grid.appendChild(row);
+  });
+  main.innerHTML = ""; main.appendChild(grid);
+  document.getElementById("pager").textContent = `Rows per page: 50   1 – ${DATA.length} of ${DATA.length}`;
+}
+setTimeout(render, 700);
+const dl = document.getElementById("download");
+if (dl) dl.addEventListener("click", () => document.getElementById("menu").dataset.open = "1");
+document.querySelectorAll("#menu [role=menuitem]").forEach(mi => mi.addEventListener("click", () => {
+  document.getElementById("menu").dataset.open = "0";
+  const rows = mode === "mismatch" ? DATA.slice(1) : DATA;
+  const blob = new Blob(["﻿" + csvText(rows)], { type: "text/csv" });
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "Call details.csv";
+  document.body.appendChild(a); a.click(); a.remove();
+}));
+document.getElementById("picker").addEventListener("click", () => document.getElementById("pickerdialog").style.display = "block");
+document.getElementById("apply").addEventListener("click", () => {
+  const p = s => { const m = s.match(/(\w{3}) (\d{1,2}), (\d{4})/); return `${m[3]}-${String(MON.indexOf(m[1])+1).padStart(2,"0")}-${m[2].padStart(2,"0")}`; };
+  range = [p(document.getElementById("start").value), p(document.getElementById("end").value)];
+  sessionStorage.setItem("picked", "1");
+  document.getElementById("pickerdialog").style.display = "none";
+  render();
+});
+</script>
+</body>
+</html>
