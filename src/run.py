@@ -92,8 +92,12 @@ def collect_rows(cfg: Config, start: date, end: date, headed: bool) -> tuple[lis
     """Drive the browser for every chunk of the range. Returns (raw rows, method notes)."""
     from .google_login import Credentials
     from .scrape import ReportScraper  # imported lazily so --from-file works without a browser
+    from .session import load_session
 
     cfg.require_scrape()
+    session_cookies = load_session(cfg.gads_session)
+    credentials = Credentials(cfg.gads_email, cfg.gads_password, cfg.gads_totp_secret) if cfg.gads_email and cfg.gads_password else None
+    log(f"[run] auth: saved_session={'yes' if session_cookies else 'no'} credentials={'yes' if credentials else 'no'} proxy={'yes' if cfg.proxy_url else 'no'}")
     chunks = split_range(start, end)
     log(f"[run] {len(chunks)} page load(s) for {start}..{end}")
     raw_rows: list[dict] = []
@@ -106,7 +110,9 @@ def collect_rows(cfg: Config, start: date, end: date, headed: bool) -> tuple[lis
         downloads_dir=cfg.downloads_dir,
         log=log,
         profile_dir=cfg.profile_dir,
-        credentials=Credentials(cfg.gads_email, cfg.gads_password, cfg.gads_totp_secret),
+        credentials=credentials,
+        session_cookies=session_cookies,
+        proxy_url=cfg.proxy_url,
     ) as scraper:
         log(f"[run] google session: {scraper.login_method}")
         for cs, ce in chunks:
@@ -115,6 +121,8 @@ def collect_rows(cfg: Config, start: date, end: date, headed: bool) -> tuple[lis
             log(f"[run] {label}: {len(result.rows)} row(s) via {result.rows_method}; date range set via {result.date_method}; page total={result.reported_total}")
             notes.append(f"{label}: rows={len(result.rows)} rows_method={result.rows_method} date_method={result.date_method}")
             raw_rows.extend(result.rows)
+        if scraper.session_outcome:
+            log(f"[run] saved session outcome: {scraper.session_outcome}")
     return raw_rows, notes
 
 

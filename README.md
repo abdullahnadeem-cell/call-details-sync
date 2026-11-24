@@ -7,9 +7,10 @@ dashboard uses that table to tie call leads to sales.
 
 - Runs entirely on GitHub Actions (06:30 HST and 18:30 HST), or by hand for any day or range.
 - Python 3.12 + Selenium (Chrome). No frontend, no n8n, no schema changes, nothing on anyone's computer.
-- Signs in to Google by itself as a dedicated Workspace account (password + authenticator code
-  from GitHub secrets). Plain Selenium, no stealth tricks: if Google challenges the login the run
-  fails with a clear code.
+- Authenticates in this order: a **saved session** captured once on a normal computer
+  (`GADS_SESSION`), then, only if that is rejected, a self sign-in as the dedicated Workspace
+  account (password + authenticator code from GitHub secrets). Plain Selenium, no stealth tricks:
+  if Google challenges the login the run fails with a clear code.
 - Idempotent: re-running a day never creates duplicates (`call_key` upsert).
 
 ```
@@ -17,6 +18,8 @@ call-details-sync/
   src/run.py             CLI entry point
   src/report_url.py      rewrites the date range inside the saved report link
   src/google_login.py    self sign-in (email, password, authenticator), screen detection
+  src/session.py         saved session (cookies) decode / inject
+  scripts/login_once.py  one time visible sign-in on your computer that exports the session
   src/scrape.py          drives Chrome, returns raw rows
   src/parse.py           normalizes rows (times, durations, call_key)
   src/supabase_sink.py   REST upsert + reconciliation reads
@@ -35,8 +38,11 @@ call-details-sync/
 1. **Date range.** With no arguments the run covers the last 2 full days in Hawaii
    time (yesterday and the day before), because Google delivers call data late and
    the upsert is idempotent. `--date`, `--from/--to` and `--lookback N` override this.
-2. **Sign in.** Chrome opens `accounts.google.com`. If the reused profile is still
-   signed in, nothing else happens. Otherwise the job types the email and password,
+2. **Sign in.** If `GADS_SESSION` is set, its Google cookies are injected into Chrome before
+   the report opens; the log then says whether Google **accepted** the saved session (the report
+   rendered) or **rejected** it (a sign-in page appeared). Without a usable session, Chrome opens
+   `accounts.google.com`. If the reused profile is still signed in, nothing else happens.
+   Otherwise the job types the email and password,
    answers the 2-Step Verification prompt with a code from the authenticator secret,
    dismisses "stay signed in" style screens and picks the right account in the chooser.
    Anything else (phone prompt, SMS, passkey, captcha, "Verify it's you") fails the run
@@ -81,7 +87,25 @@ Authenticator → "Set up" (or "Change") → **"Can't scan it?"** shows the base
 (letters and digits, spaces are fine). Also scan the QR code into a phone app so a human
 keeps a working second factor.
 
-### 2.2 GitHub secrets and variables
+### 2.2 Capture the saved session once (recommended first path)
+
+Scripted sign-ins from GitHub's datacenter addresses are usually met with a CAPTCHA (see §6),
+while a session that was created on a normal connection is typically accepted for weeks. So
+the first thing to try is a saved session:
+
+```bash
+pip install -r requirements.txt
+python scripts/login_once.py --url "<saved report link>"
+```
+
+A Chrome window opens; sign in by hand (email, password, 2-step verification). When the
+Call details report has loaded, the script writes `gads_session.json` (git-ignored) and prints
+the one-liner to store it as the secret `GADS_SESSION` (base64 of the file). Nothing is
+printed from the file itself. When Google later rejects that session the run fails with
+`SESSION_EXPIRED` (or falls back to the credentials if they are set); run the script again
+and update the secret.
+
+### 2.3 GitHub secrets and variables
 
 Repo → **Settings → Secrets and variables → Actions**. Never paste these anywhere else.
 
@@ -90,6 +114,8 @@ Repo → **Settings → Secrets and variables → Actions**. Never paste these a
 | `GADS_EMAIL` | secret | the dedicated account's email |
 | `GADS_PASSWORD` | secret | its password |
 | `GADS_TOTP_SECRET` | secret | the authenticator base32 secret (see §2.1) |
+| `GADS_SESSION` | secret | base64 of `gads_session.json` from `scripts/login_once.py` (see §2.2); with it, email/password are only a fallback |
+| `GADS_PROXY_URL` | secret, optional | `http://host:port` or `socks5://host:port` the browser should use; leave empty for a direct connection. Chrome cannot send proxy passwords, so use an IP-allowlisted proxy |
 | `GADS_REPORT_URL` | secret | the full saved "Call details" report link |
 | `SUPABASE_URL` | secret | `https://hdwkfqjgnuahqmmaseor.supabase.co` |
 | `SUPABASE_SERVICE_ROLE_KEY` | secret | Supabase → Project Settings → API → `service_role` |
@@ -99,14 +125,15 @@ Repo → **Settings → Secrets and variables → Actions**. Never paste these a
 | `GADS_PROFILE_DIR` | **variable**, optional | persistent Chrome profile folder on a self-hosted runner |
 
 The workflow's first step checks these and fails with `MISSING_SECRETS`, printing only the
-**names** that are empty.
+**names** that are empty. Required: `GADS_REPORT_URL` plus either `GADS_SESSION` or
+`GADS_EMAIL` + `GADS_PASSWORD`.
 
 **The repository must be private before real data runs.** Logs are masked, but failure
 screenshots, downloads and the cached Chrome profile (cookies) are only kept when the
 repository is private; the workflow checks this itself and skips them otherwise.
 Settings → General → Danger Zone → Change visibility.
 
-### 2.3 Enabling the schedule
+### 2.4 Enabling the schedule
 
 The workflow is kept disabled until the secrets exist. Turn it on with:
 
@@ -245,7 +272,7 @@ The last log line reads `ERROR <CODE>: <detail>`; the workflow posts `<CODE>` to
 | `LOGIN_TOTP_REJECTED` | The code was refused. | Wrong secret, or the account's authenticator was re-enrolled: generate a new secret and update it. Runner clocks are accurate, so skew is unlikely. |
 | `LOGIN_CHALLENGE` | Google asked for something a script cannot do (phone tap, SMS, passkey, captcha, "Verify it's you", "browser not secure"), or showed an unknown screen. | See the screenshot `debug/login-*.png`. Follow §6. Make the authenticator the default second step and remove phone prompts if possible. |
 | `ADS_NO_ACCESS` | Signed in, but Google Ads shows an account chooser or "no access" for the report. | Give the dedicated user access to the Ads account in the saved link (customer id in `ocid=`). |
-| `SESSION_EXPIRED` | Landed on a sign-in page even after the self-login retry. | Usually a `LOGIN_*` cause further up the log; otherwise re-run. |
+| `SESSION_EXPIRED` | The saved session was rejected (log says `saved session rejected`) and no credentials could sign in, or a sign-in page appeared even after the retry. | Run `scripts/login_once.py` again and update `GADS_SESSION`; or look for a `LOGIN_*` cause further up the log. |
 | `TABLE_NOT_RENDERED` | The report page loaded but neither the grid nor a "no data" message appeared within 90 s. | Open the saved link in a browser: is the report still there, same account? Google Ads UI change → check the HTML in `debug/`. Transient → re-run. |
 | `DATE_RANGE_MISMATCH` | The page did not show the requested range after the URL rewrite and the date picker fallback, or rows start outside it. | Check the report link still has a *custom* date range. If the date picker layout changed, see `_set_range_via_ui` in `src/scrape.py`. |
 | `ROWCOUNT_MISMATCH` | Rows captured ≠ the total the page shows. | Re-run once (slow render). If it repeats, check the CSV download in a browser; maybe it includes extra summary rows (`parse.rows_from_csv_text`). |

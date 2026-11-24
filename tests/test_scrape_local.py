@@ -70,7 +70,7 @@ def creds(totp=True):
 def scraper_factory(server, tmp_path):
     from src.scrape import ReportScraper
 
-    def make(mode="normal", timeout_ms=20_000, login_mode=None, credentials=None, profile=False):
+    def make(mode="normal", timeout_ms=20_000, login_mode=None, credentials=None, profile=False, session_cookies=None):
         url = f"{server}/fake_report/index.html?ocid=1&mode={mode}&reportState={REPORT_STATE}"
         return ReportScraper(
             report_url=url,
@@ -83,6 +83,7 @@ def scraper_factory(server, tmp_path):
             profile_dir=str(tmp_path / "profile") if profile else None,
             credentials=credentials,
             accounts_url=f"{server}/fake_login/index.html?mode={login_mode}" if login_mode else None,
+            session_cookies=session_cookies,
         )
 
     return make
@@ -196,3 +197,35 @@ def test_login_failures(scraper_factory, server, tmp_path, mode, totp, code):
     assert e.value.code == code
     assert list((tmp_path / "debug").glob("login-*.png")), "a screenshot of the login page is saved on failure"
     assert "correct horse" not in str(e.value) and "correct horse" not in "".join(p.name for p in (tmp_path / "debug").iterdir())
+
+
+# ---- saved session (cookie injection) --------------------------------------------
+
+def _session_cookie():
+    return [{"name": "fake_session", "value": "ok", "domain": "127.0.0.1", "path": "/", "secure": False, "httpOnly": False, "expires": 4102444800}]
+
+
+def test_saved_session_accepted(scraper_factory):
+    with scraper_factory("cookie", session_cookies=_session_cookie()) as s:
+        assert s.login_method == "saved-session(1)"
+        r = s.fetch(date(2026, 11, 20), date(2026, 11, 20))
+        assert s.session_outcome == "accepted"
+    assert len(r.rows) == 4
+
+
+def test_saved_session_rejected_without_credentials(scraper_factory):
+    bad = [dict(_session_cookie()[0], value="stale")]
+    with scraper_factory("cookie", session_cookies=bad) as s, pytest.raises(SyncError) as e:
+        s.fetch(date(2026, 11, 20), date(2026, 11, 20))
+    assert e.value.code == "SESSION_EXPIRED"
+    assert s.session_outcome == "rejected"
+
+
+def test_saved_session_rejected_falls_back_to_login(scraper_factory):
+    # the fake report ignores the login (it only checks the cookie), so the fallback still ends in
+    # SESSION_EXPIRED, but the self-login must have been attempted first
+    bad = [dict(_session_cookie()[0], value="stale")]
+    with scraper_factory("cookie", session_cookies=bad, login_mode="ok", credentials=creds()) as s, pytest.raises(SyncError) as e:
+        s.fetch(date(2026, 11, 20), date(2026, 11, 20))
+    assert e.value.code == "SESSION_EXPIRED"
+    assert s.login_method == "password+totp"

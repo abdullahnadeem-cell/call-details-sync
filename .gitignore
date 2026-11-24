@@ -1,4 +1,6 @@
 # secrets and session material: never commit
+gads_session.json
+.login-profile/
 storage_state.json
 storage-state.json
 *.storage_state.json

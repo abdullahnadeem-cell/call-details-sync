@@ -42,6 +42,7 @@ from .errors import (
 from .google_login import Credentials, assert_ads_access, ensure_logged_in, is_signed_out_url
 from .parse import REPORT_COLUMNS, map_headers, rows_from_csv_text
 from .report_url import build_report_url
+from .session import inject_cookies, summarize
 
 SIGNIN_TEXT = re.compile(
     r"verify it.s you|sign in to continue|choose an account|2-step verification|"
@@ -130,6 +131,8 @@ class ReportScraper:
         profile_dir: str | None = None,
         credentials: Credentials | None = None,
         accounts_url: str | None = None,
+        session_cookies: list[dict] | None = None,
+        proxy_url: str | None = None,
     ):
         self.report_url = report_url
         self.account_tz = account_tz
@@ -141,8 +144,11 @@ class ReportScraper:
         self.profile_dir = profile_dir
         self.credentials = credentials
         self.accounts_url = accounts_url
+        self.session_cookies = session_cookies or []
+        self.proxy_url = proxy_url
         self.driver: webdriver.Chrome | None = None
         self.login_method: str | None = None
+        self.session_outcome: str | None = None  # accepted | rejected | not-used
         self._relogin_done = False
 
     # -- lifecycle ---------------------------------------------------------
@@ -150,9 +156,16 @@ class ReportScraper:
         self.debug_dir.mkdir(parents=True, exist_ok=True)
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
         self.driver = self._build_driver()
-        if self.credentials:
+        if self.session_cookies:
+            n = inject_cookies(self.driver, self.session_cookies)
+            self.log(f"[scrape] injected saved session: {summarize(self.session_cookies)}")
+            self.login_method = f"saved-session({n})"
+            self.session_outcome = "pending"
+        elif self.credentials:
             kwargs = {"accounts_url": self.accounts_url} if self.accounts_url else {}
             self.login_method = ensure_logged_in(self.driver, self.credentials, log=self.log, debug_dir=self.debug_dir, **kwargs)
+        else:
+            self.login_method = "profile-only"
         return self
 
     def __exit__(self, *exc) -> None:
@@ -173,6 +186,11 @@ class ReportScraper:
         opts.add_argument("--disable-gpu")
         if self.profile_dir:
             opts.add_argument(f"--user-data-dir={Path(self.profile_dir).resolve()}")
+        if self.proxy_url:
+            if "@" in self.proxy_url.split("://", 1)[-1]:
+                self.log("[scrape] GADS_PROXY_URL contains credentials; Chrome cannot send proxy passwords, use an IP-allowlisted proxy")
+            opts.add_argument(f"--proxy-server={self.proxy_url}")
+            self.log(f"[scrape] using proxy host {_host(self.proxy_url) or self.proxy_url.split('@')[-1]}")
         opts.add_experimental_option(
             "prefs",
             {
@@ -216,6 +234,8 @@ class ReportScraper:
             except TimeoutException as exc:
                 raise SyncError(TABLE_NOT_RENDERED, f"timed out while reading the report: {str(exc).splitlines()[0]}") from exc
         except SyncError as exc:
+            if exc.code == SESSION_EXPIRED and self.session_outcome == "pending":
+                self.session_outcome = "rejected"
             self._dump(f"{label}-{exc.code}")
             raise
 
@@ -226,14 +246,17 @@ class ReportScraper:
         self._goto_with_retry(url)
         self._assert_signed_in(url)
         assert_ads_access(d, log=self.log)
-        self._wait_for_report()
+        self._wait_for_report(url)
         self._assert_signed_in(url)
+        if self.session_outcome == "pending":
+            self.session_outcome = "accepted"
+            self.log("[scrape] saved session accepted: report rendered without any sign-in page")
 
         date_method = "url"
         if not self._range_matches(start, end):
             self.log("[scrape] page does not show the requested range after URL rewrite; trying the date picker")
             self._set_range_via_ui(start, end)
-            self._wait_for_report()
+            self._wait_for_report(url)
             if not self._range_matches(start, end):
                 raise SyncError(DATE_RANGE_MISMATCH, f"page shows {self._visible_date_like_text()!r}, wanted {start}..{end}")
             date_method = "ui"
@@ -305,6 +328,9 @@ class ReportScraper:
             signed_out = True
         if not signed_out:
             return
+        if self.session_outcome == "pending":
+            self.session_outcome = "rejected"
+            self.log(f"[scrape] saved session rejected: landed on {_host(url)} ({(self.driver.title or '')[:60]!r})")
         if self.credentials and not self._relogin_done:
             self._relogin_done = True
             self.log(f"[scrape] landed on a sign-in page at {_host(url)}; signing in with the configured account")
@@ -315,14 +341,15 @@ class ReportScraper:
                 return
         raise SyncError(SESSION_EXPIRED, f"landed on a Google sign in page ({_host(self.driver.current_url)}) instead of the report")
 
-    def _wait_for_report(self) -> None:
+    def _wait_for_report(self, report_url: str) -> None:
         deadline = time.time() + self.timeout_ms / 1000
         while time.time() < deadline:
             if self._report_visible() or self._no_data_shown() or self._reported_total() is not None:
                 time.sleep(1.5)  # let the grid finish painting
                 return
             if self._signin_text_shown() or is_signed_out_url(self.driver.current_url or ""):
-                raise SyncError(SESSION_EXPIRED, "page asks to sign in or verify identity instead of showing the report")
+                self._assert_signed_in(report_url)  # raises SESSION_EXPIRED, or signs in again and reloads
+                continue
             time.sleep(1)
         raise SyncError(TABLE_NOT_RENDERED, "report grid did not render and no 'no data' message appeared")
 

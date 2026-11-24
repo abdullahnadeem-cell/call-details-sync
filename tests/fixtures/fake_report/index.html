@@ -24,6 +24,7 @@
     mismatch - the CSV has one row fewer than the paginator claims
     hang     - nothing ever renders
     ignore   - the page ignores reportState dates until the date picker is used
+    cookie   - behaves like "signin" unless the cookie fake_session=ok is present
 -->
 <header>
   <button id="picker" role="button" aria-label="Date range">loading</button>
@@ -46,7 +47,8 @@
 <script>
 const MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 const q = new URLSearchParams(location.search);
-const mode = q.get("mode") || "normal";
+let mode = q.get("mode") || "normal";
+if (mode === "cookie") mode = /(^|; )fake_session=ok(;|$)/.test(document.cookie) ? "normal" : "signin";
 const stateDates = (() => {
   const s = q.get("reportState") || "";
   try {

@@ -128,3 +128,20 @@ def test_dry_run_masks_phone_numbers(tmp_path, monkeypatch, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "***3603" in out and "808-688-3603" not in out
+
+
+def test_saved_session_alone_satisfies_preflight(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GADS_REPORT_URL", "https://ads.google.com/aw/reporteditor/view?reportState=x")
+    for name in ("GADS_EMAIL", "GADS_PASSWORD", "GADS_TOTP_SECRET"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GADS_SESSION", json.dumps([{"name": "SID", "value": "v", "domain": ".google.com"}]))
+    seen = {}
+
+    def fake_collect(cfg, start, end, headed):
+        seen["session"] = cfg.gads_session
+        return [], []
+
+    monkeypatch.setattr(run, "collect_rows", fake_collect)
+    assert run.main(["--date", "2026-11-20", "--dry-run", "--no-reconcile"]) == 0
+    assert seen["session"]

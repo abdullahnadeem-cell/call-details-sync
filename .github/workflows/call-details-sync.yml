@@ -41,6 +41,8 @@ jobs:
       GADS_EMAIL: ${{ secrets.GADS_EMAIL }}
       GADS_PASSWORD: ${{ secrets.GADS_PASSWORD }}
       GADS_TOTP_SECRET: ${{ secrets.GADS_TOTP_SECRET }}
+      GADS_SESSION: ${{ secrets.GADS_SESSION }}
+      GADS_PROXY_URL: ${{ secrets.GADS_PROXY_URL }}
       GADS_REPORT_URL: ${{ secrets.GADS_REPORT_URL }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -61,10 +63,17 @@ jobs:
           done
           [ -n "$GADS_EMAIL" ] && echo "::add-mask::${GADS_EMAIL%%@*}"
           MISSING=""
-          for v in GADS_EMAIL GADS_PASSWORD GADS_REPORT_URL; do
-            [ -z "${!v}" ] && MISSING="$MISSING $v"
-          done
-          [ -z "$GADS_TOTP_SECRET" ] && echo "::warning::GADS_TOTP_SECRET is empty: the run fails with LOGIN_TOTP_MISSING if Google asks for an authenticator code"
+          [ -z "$GADS_REPORT_URL" ] && MISSING="$MISSING GADS_REPORT_URL"
+          if [ -n "$GADS_SESSION" ]; then
+            echo "auth: saved session (GADS_SESSION) first, credentials as fallback: $([ -n "$GADS_EMAIL" ] && [ -n "$GADS_PASSWORD" ] && echo yes || echo no)"
+          else
+            echo "auth: no GADS_SESSION, self sign-in with credentials"
+            for v in GADS_EMAIL GADS_PASSWORD; do
+              [ -z "${!v}" ] && MISSING="$MISSING $v"
+            done
+          fi
+          [ -z "$GADS_TOTP_SECRET" ] && echo "::warning::GADS_TOTP_SECRET is empty: a sign-in fails with LOGIN_TOTP_MISSING if Google asks for an authenticator code"
+          [ -n "$GADS_PROXY_URL" ] && echo "proxy: GADS_PROXY_URL is set" || echo "proxy: none"
           if [ "$IS_DRY" != "true" ]; then
             for v in SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY; do
               [ -z "${!v}" ] && MISSING="$MISSING $v"

@@ -20,6 +20,8 @@ class Config:
     gads_password: str | None = field(default=None, repr=False)
     gads_totp_secret: str | None = field(default=None, repr=False)
     profile_dir: str | None = None
+    gads_session: str | None = field(default=None, repr=False)
+    proxy_url: str | None = None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -34,6 +36,8 @@ class Config:
             gads_password=os.environ.get("GADS_PASSWORD") or None,
             gads_totp_secret=os.environ.get("GADS_TOTP_SECRET") or None,
             profile_dir=os.environ.get("GADS_PROFILE_DIR") or ".chrome-profile",
+            gads_session=os.environ.get("GADS_SESSION") or None,
+            proxy_url=os.environ.get("GADS_PROXY_URL") or None,
         )
 
     def missing_login_secrets(self) -> list[str]:
@@ -42,9 +46,11 @@ class Config:
     def require_scrape(self) -> None:
         if not self.report_url:
             raise SyncError(MISSING_SECRETS, "GADS_REPORT_URL is not set")
+        if self.gads_session:
+            return  # a saved session is enough; credentials are only a fallback
         missing = self.missing_login_secrets()
         if missing:
-            raise SyncError(MISSING_SECRETS, f"missing: {', '.join(missing)} (GADS_TOTP_SECRET is needed too when the account has 2-Step Verification)")
+            raise SyncError(MISSING_SECRETS, f"missing: {', '.join(missing)} or GADS_SESSION (GADS_TOTP_SECRET is needed too when the account has 2-Step Verification)")
 
     def require_supabase(self) -> None:
         if not self.supabase_url or not self.supabase_key:
