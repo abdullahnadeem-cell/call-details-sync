@@ -99,3 +99,11 @@ def test_scrape_failure_writes_error_code(tmp_path, monkeypatch):
     rc = run.main(["--date", "2026-11-20", "--dry-run"])
     assert rc == 1
     assert (tmp_path / "debug" / "error_code.txt").read_text() == "SESSION_EXPIRED"
+
+
+def test_assert_rows_in_range():
+    rows = [{"start_time": "2026-11-20T23:30:00-10:00"}, {"start_time": "2026-11-21T00:10:00-10:00"}]
+    run.assert_rows_in_range(rows, date(2026, 11, 20), date(2026, 11, 21), "Pacific/Honolulu")
+    with pytest.raises(SyncError) as e:
+        run.assert_rows_in_range(rows, date(2026, 11, 20), date(2026, 11, 20), "Pacific/Honolulu")
+    assert e.value.code == "DATE_RANGE_MISMATCH"

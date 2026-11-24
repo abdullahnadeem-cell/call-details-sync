@@ -20,7 +20,7 @@ from pathlib import Path
 from . import parse
 from .config import Config
 from .dates import HST, days_in, default_range, split_range
-from .errors import CONFIG_ERROR, SyncError
+from .errors import CONFIG_ERROR, DATE_RANGE_MISMATCH, SyncError
 from .reconcile import format_table, print_reconciliation
 
 
@@ -114,6 +114,17 @@ def collect_rows(cfg: Config, start: date, end: date, headed: bool) -> tuple[lis
     return raw_rows, notes
 
 
+def assert_rows_in_range(rows: list[dict], start: date, end: date, tz: str) -> None:
+    """Second guard after the on-page check: every call must start inside the range (account tz)."""
+    from zoneinfo import ZoneInfo
+
+    zone = ZoneInfo(tz)
+    outside = [r for r in rows if not (start <= datetime.fromisoformat(r["start_time"]).astimezone(zone).date() <= end)]
+    if outside:
+        sample = ", ".join(r["start_time"] for r in outside[:3])
+        raise SyncError(DATE_RANGE_MISMATCH, f"{len(outside)} row(s) start outside {start}..{end} (e.g. {sample}); the page did not honour the requested range")
+
+
 def print_rows(rows: list[dict]) -> None:
     body = [
         [r["start_time"], r["duration_seconds"], r["caller_phone_raw"], r["call_type"], r["campaign"], r["call_key"][:10]]
@@ -142,6 +153,8 @@ def main(argv: list[str] | None = None) -> int:
 
         rows = parse.dedupe(parse.normalize_rows(raw_rows, cfg.account_tz, warn=log), warn=log)
         log(f"[run] {len(rows)} unique row(s) after normalization")
+        if not args.from_file:
+            assert_rows_in_range(rows, start, end, cfg.account_tz)
 
         if args.dry_run:
             out = Path(args.out or f"out/rows_{start}_{end}.json")
