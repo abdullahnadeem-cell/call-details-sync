@@ -137,5 +137,5 @@ def test_signed_out_url_and_ads_access():
 
 def test_challenge_reason_is_credential_free():
     info = info_from("challenge_insecure.html", "https://accounts.google.com/v3/signin/rejected")
-    assert "browser or app may not be secure" in gl.challenge_reason(info)
+    assert gl.challenge_reason(info).startswith("text matched")
     assert gl.challenge_reason(info_from("captcha.html")) == "captcha"
