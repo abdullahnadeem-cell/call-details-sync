@@ -1,0 +1,23 @@
+# secrets and session material: never commit
+storage_state.json
+storage-state.json
+*.storage_state.json
+.env
+.env.*
+browser-profile/
+.playwright-profile/
+
+# run output (contains phone numbers)
+debug/
+downloads/
+out/
+*.png
+*.csv
+!tests/fixtures/*.csv
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
